@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>科研写作助手</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="application-shell">
+      <aside class="sidebar" aria-label="主导航">
+        <header class="brand-block">
+          <div class="brand-row">
+            <div class="brand-mark" aria-hidden="true">R</div>
+            <div>
+              <p class="brand-kicker">RESEARCH STUDIO</p>
+              <h1>科研写作助手</h1>
+            </div>
+          </div>
+          <p id="statusText" class="status-pill">就绪</p>
+        </header>
+
+        <nav id="mainNav" class="main-nav" aria-label="工作区">
+          <button class="nav-item active" type="button" data-view="workbench" data-icon="⌘">工作台</button>
+          <button class="nav-item" type="button" data-view="library" data-icon="▤">文献库</button>
+          <button class="nav-item" type="button" data-view="reader" data-icon="◫">论文阅读</button>
+          <button class="nav-item" type="button" data-view="writing" data-icon="✎">写作</button>
+          <button class="nav-item" type="button" data-view="discover" data-icon="◇">发现</button>
+        </nav>
+
+        <section class="sidebar-section project-switcher">
+          <div class="section-label">当前项目</div>
+          <select id="sessionSelect" title="选择项目会话"></select>
+          <button id="newSessionBtn" class="primary-button full-button" type="button">新建项目</button>
+        </section>
+
+        <section class="sidebar-section project-signal">
+          <div class="section-label">项目状态</div>
+          <dl id="projectSignal" class="signal-list"></dl>
+        </section>
+
+        <footer class="sidebar-footer">
+          <button id="clearBtn" class="quiet-button" type="button">清空当前会话</button>
+        </footer>
+      </aside>
+
+      <section class="workspace">
+        <header class="workspace-header">
+          <div class="workspace-title-block">
+            <p id="viewEyebrow" class="eyebrow">项目工作台</p>
+            <h2 id="viewTitle">研究与写作</h2>
+            <div class="workspace-meta-row">
+              <span id="workspaceMeta">未设置研究主题</span>
+            </div>
+          </div>
+          <div class="header-actions">
+            <figure class="workspace-visual" aria-hidden="true">
+              <img src="/assets/research-desk.png" alt="" loading="lazy" />
+            </figure>
+            <button id="uploadPdfBtn" class="secondary-button" type="button">上传 PDF</button>
+            <input id="pdfInput" type="file" accept="application/pdf,.pdf" hidden />
+          </div>
+        </header>
+
+        <div class="workspace-views">
+          <section id="workbenchView" class="view active" aria-label="项目工作台">
+            <div class="workbench-grid">
+              <section class="conversation-surface">
+                <div class="surface-heading">
+                  <div>
+                    <p class="eyebrow">对话</p>
+                    <h3>研究协作</h3>
+                  </div>
+                  <span id="uploadInfo" class="inline-status">未上传 PDF</span>
+                </div>
+                <div id="messages" class="messages" aria-live="polite"></div>
+                <form id="chatForm" class="composer">
+                  <textarea id="messageInput" rows="3" placeholder="描述研究问题、上传论文后提问，或直接要求生成章节"></textarea>
+                  <button id="sendBtn" class="primary-button" type="submit">发送</button>
+                </form>
+              </section>
+
+              <aside class="context-rail" aria-label="当前研究上下文">
+                <section class="rail-section">
+                  <div class="surface-heading compact-heading">
+                    <div><p class="eyebrow">研究范围</p><h3>识别结果</h3></div>
+                  </div>
+                  <div id="intentView" class="intent-view muted">等待请求</div>
+                </section>
+                <section class="rail-section">
+                  <div class="surface-heading compact-heading">
+                    <div><p class="eyebrow">运行记录</p><h3>证据状态</h3></div>
+                  </div>
+                  <div id="debugView" class="debug-view muted">等待请求</div>
+                </section>
+                <section class="rail-section rail-grow">
+                  <div class="surface-heading compact-heading">
+                    <div><p class="eyebrow">当前证据</p><h3>论文池</h3></div>
+                    <span id="paperCount" class="counter">0</span>
+                  </div>
+                  <div id="evidencePreview" class="evidence-preview muted">暂无论文</div>
+                </section>
+              </aside>
+            </div>
+          </section>
+
+          <section id="libraryView" class="view" aria-label="文献库">
+            <div class="view-toolbar">
+              <div class="metric-strip">
+                <span><strong id="libraryPaperCount">0</strong> 篇论文</span>
+                <span><strong id="selectedPaperCount">0</strong> 篇纳入写作</span>
+                <span><strong id="abstractCount">0</strong> 篇有摘要</span>
+              </div>
+              <div class="toolbar-controls">
+                <select id="sourceFilter" title="按来源筛选"><option value="all">全部来源</option></select>
+                <select id="yearFilter" title="按年份筛选"><option value="all">全部年份</option></select>
+              </div>
+            </div>
+            <section class="library-table-wrap">
+              <table class="library-table">
+                <thead><tr><th>纳入</th><th>论文</th><th>来源</th><th>年份</th><th>状态 / 原文</th></tr></thead>
+                <tbody id="libraryTableBody"></tbody>
+              </table>
+              <div id="libraryEmpty" class="empty-state visual-empty">
+                <img src="/assets/paper-stack.png" alt="" loading="lazy" />
+                <p>检索后的论文会出现在这里。</p>
+              </div>
+            </section>
+          </section>
+
+          <section id="readerView" class="view" aria-label="论文阅读">
+            <div class="reader-layout">
+              <aside id="documentList" class="document-list"></aside>
+              <section class="reader-content">
+                <div id="readerHeading" class="reader-heading"></div>
+                <div id="readerBody" class="reader-body muted">上传论文后，可在这里查看阅读状态、全文解析和页码证据。</div>
+              </section>
+            </div>
+          </section>
+
+          <section id="writingView" class="view" aria-label="写作">
+            <div class="writing-layout">
+              <aside class="writing-sidebar">
+                <div class="surface-heading compact-heading"><div><p class="eyebrow">写作计划</p><h3>章节</h3></div></div>
+                <ol id="outlineView" class="outline-view"></ol>
+                <div class="writing-actions">
+                  <button class="secondary-button prompt-action" type="button" data-prompt="基于当前证据池生成一份论文大纲">生成大纲</button>
+                  <button class="secondary-button prompt-action" type="button" data-prompt="基于当前证据池生成 related work">生成 Related Work</button>
+                </div>
+              </aside>
+              <section class="draft-surface">
+                <div class="surface-heading">
+                  <div><p class="eyebrow">草稿</p><h3 id="draftTitle">尚未生成草稿</h3></div>
+                  <span id="draftEvidence" class="inline-status">0 篇证据</span>
+                </div>
+                <div id="draftMeta" class="draft-meta muted"></div>
+                <article id="draftPreview" class="draft-preview muted">生成的章节会在这里预览，并保留对应文件与引用状态。</article>
+                <div id="fileList" class="file-list muted">暂无生成文件</div>
+              </section>
+            </div>
+          </section>
+
+          <section id="discoverView" class="view" aria-label="发现">
+            <div class="discover-grid">
+              <section class="discover-section">
+                <div class="discover-head">
+                  <div><p class="eyebrow">主题订阅</p><h3>关注方向</h3></div>
+                  <button id="refreshDiscoveryBtn" class="secondary-button compact-button" type="button">刷新发现</button>
+                </div>
+                <div id="topicList" class="topic-list"></div>
+              </section>
+              <section class="discover-section">
+                <p class="eyebrow">最新文献</p>
+                <h3>增量动态</h3>
+                <div id="feedList" class="feed-list"></div>
+              </section>
+              <section class="discover-section">
+                <p class="eyebrow">研究机会</p>
+                <h3>待验证方向</h3>
+                <div id="directionList" class="direction-list"></div>
+              </section>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      window.MathJax = {
+        tex: { inlineMath: [["$", "$"], ["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] },
+        svg: { fontCache: "global" }
+      };
+    </script>
+    <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+    <script src="/api.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

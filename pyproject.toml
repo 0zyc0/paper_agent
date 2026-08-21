@@ -1,0 +1,12 @@
+[project]
+name = "paper-related-work-agent"
+version = "0.1.0"
+description = "A lightweight paper search and Related Work drafting agent."
+requires-python = ">=3.10"
+dependencies = ["pypdf>=6.0"]
+
+[project.scripts]
+paper-agent = "paper_agent.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

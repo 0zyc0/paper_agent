@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.idea/
+.env
+.env.*
+!.env.example
+.DS_Store
+src/paper_agent/local_config.py
+# Local research assets: metadata, session state, full texts, and generated drafts.
+data/
+outputs/
