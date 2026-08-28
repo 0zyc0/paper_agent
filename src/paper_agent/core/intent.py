@@ -129,6 +129,16 @@ class IntentAnalyzer:
                 proposed_topic = normalize_text(str(data.get("normalized_topic") or ""))
             else:
                 raise ValueError("paper_search 的主题字段回显了完整用户请求，未获得可用的规范研究主题。")
+        # Tool planning is semantic, but external academic indexes expect
+        # English technical terms. Treat a non-English query payload as an
+        # invalid tool contract and ask the model to compile it again instead
+        # of sending Chinese strings to DBLP/OpenAlex/arXiv.
+        if _requires_english_query_repair(data):
+            repaired = self.repair_search_queries(request, data)
+            if not repaired:
+                raise ValueError("Kimi 未能将检索计划编译为英文关键词，已停止外部检索以避免无效查询。")
+            data.update(repaired)
+            proposed_topic = normalize_text(str(data.get("normalized_topic") or ""))
         if not proposed_topic:
             raise ValueError("paper_search 缺少规范化研究主题；请重新提供 normalized_topic。")
         data["normalized_topic"] = proposed_topic
@@ -198,6 +208,74 @@ Example: "调研一下最近三年去偏推荐系统工作进展" ->
             "queries": _clean_list(data.get("queries")),
             "cs_area": normalize_text(str(data.get("cs_area") or "")),
         }
+
+    def repair_search_queries(self, request: str, plan: dict) -> dict:
+        """Compile malformed/Chinese search terms into source-ready English queries.
+
+        This is a tool-input repair, not a Python intent classifier: Kimi still
+        determines the actual research object and its technical modifiers.
+        """
+        if not self.llm.available:
+            return {}
+        system = (
+            "You compile a CS literature-search plan for English academic indexes. "
+            "Return only valid JSON. The incoming plan has unusable non-English or malformed search terms. "
+            "Extract the exact academic research object from the user request, preserve every essential modifier, "
+            "and output only concise ASCII English technical terms for normalized_topic, keywords, queries, and source_queries. "
+            "Do not include Chinese, action verbs, years, venue grades, survey/review/document/output words, or whole user sentences."
+        )
+        user = f"""
+User request: {request}
+Invalid search plan: {plan}
+
+Return exactly:
+{{
+  "normalized_topic": "concise English canonical research topic",
+  "display_topic": "concise Chinese UI label",
+  "keywords": ["4-8 ASCII English technical keywords"],
+  "queries": ["3-6 ASCII English paper-search query variants"],
+  "source_queries": {{
+    "openalex": ["1-3 English queries"],
+    "dblp": ["1-3 short English title-friendly queries"],
+    "arxiv": ["1-3 English technical queries"],
+    "semantic_scholar": ["1-3 English queries"],
+    "google_scholar": ["1-3 English synonym queries"]
+  }},
+  "cs_area": "one CS area",
+  "recent_years": "integer or null",
+  "from_year": "integer or null",
+  "to_year": "integer or null"
+}}
+
+Example: "调研动态去偏推荐系统近三年研究进展" ->
+{{"normalized_topic":"debiasing dynamic recommender systems","display_topic":"动态去偏推荐系统","keywords":["debiasing","bias mitigation","dynamic recommendation","temporal recommendation","recommender systems"],"queries":["debiasing dynamic recommender systems","debiasing temporal recommendation","bias mitigation sequential recommendation"],"source_queries":{{"openalex":["debiasing dynamic recommender systems","bias mitigation temporal recommendation"],"dblp":["debiasing dynamic rec","temporal rec bias"],"arxiv":["debiasing sequential recommendation","unbiased dynamic recommendation"],"semantic_scholar":["debiasing dynamic recommender systems"],"google_scholar":["bias mitigation temporal recommender systems"]}},"cs_area":"AI"}}
+"""
+        try:
+            data = self.llm.chat_json(
+                system=system,
+                user=user,
+                temperature=0.1,
+                max_tokens=900,
+                timeout=ROUTING_LLM_TIMEOUT,
+                stream=False,
+                label="search_query_repair",
+            )
+        except Exception:
+            return {}
+        if not isinstance(data, dict) or _requires_english_query_repair(data):
+            return {}
+        repaired = {
+            "normalized_topic": normalize_text(str(data.get("normalized_topic") or "")),
+            "display_topic": normalize_text(str(data.get("display_topic") or "")),
+            "keywords": _clean_list(data.get("keywords")),
+            "queries": _clean_list(data.get("queries")),
+            "source_queries": data.get("source_queries") if isinstance(data.get("source_queries"), dict) else {},
+            "cs_area": normalize_text(str(data.get("cs_area") or "")),
+        }
+        for key in ("recent_years", "from_year", "to_year"):
+            if data.get(key) is not None:
+                repaired[key] = data[key]
+        return repaired
 
     def analyze_action(self, request: str, *, mode: str = "auto", has_papers: bool = False) -> ActionIntent:
         if mode == "chat":
@@ -562,6 +640,24 @@ def _clean_list(value) -> list[str]:
         return []
     cleaned = [normalize_text(str(item)) for item in value]
     return [item for item in cleaned if item]
+
+
+def _requires_english_query_repair(data: dict) -> bool:
+    """Validate the search-tool payload shape without inferring its topic locally."""
+    candidates = [str(data.get("normalized_topic") or data.get("topic") or "")]
+    candidates.extend(_clean_list(data.get("keywords")))
+    candidates.extend(_clean_list(data.get("queries")))
+    source_queries = data.get("source_queries")
+    if isinstance(source_queries, dict):
+        for queries in source_queries.values():
+            candidates.extend(_clean_list(queries))
+    meaningful = [item for item in candidates if item]
+    if not meaningful:
+        return True
+    # This is transport validation for English-first scholarly APIs, not a
+    # semantic routing rule. Search terms may use punctuation but need at
+    # least one ASCII letter and cannot contain non-ASCII characters.
+    return any((not item.isascii()) or not any("a" <= char.lower() <= "z" for char in item) for item in meaningful)
 
 
 def _clean_source_queries(value, fallback_queries: list[str]) -> dict[str, list[str]]:

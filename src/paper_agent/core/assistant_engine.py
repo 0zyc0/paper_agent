@@ -2670,7 +2670,18 @@ def _is_source_rate_or_permission_error(value: str) -> bool:
 
 def _search_answer_summary(intent: ResearchIntent, papers: list[Paper], source_summary: str) -> str:
     if not papers:
-        return "没有在当前约束下找到可用论文。可以放宽年份、会议/期刊限制，或换一个更短的英文关键词重试。"
+        attempted_queries = list(dict.fromkeys(
+            query
+            for queries in _source_query_plan(intent, max_queries=1).values()
+            for query in queries
+            if query
+        ))[:5]
+        query_hint = "；".join(attempted_queries)
+        return (
+            "没有在当前约束下找到可用论文。"
+            + (f"本次已使用英文检索式：{query_hint}。" if query_hint else "")
+            + "可以放宽年份、会议/期刊限制，或换一个更短的英文关键词重试。"
+        )
     lines = [
         f"已完成检索：**{intent.normalized_topic}**。",
         "",

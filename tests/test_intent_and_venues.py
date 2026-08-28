@@ -342,6 +342,46 @@ def test_agent_request_echo_is_repaired_by_llm_before_becoming_a_research_topic(
     assert intent.queries == ["debiasing recommender systems", "debiasing recommendation"]
 
 
+def test_agent_plan_with_chinese_search_terms_is_recompiled_by_kimi_before_retrieval():
+    class QueryRepairLlm:
+        available = True
+
+        def chat_json(self, **kwargs):
+            assert kwargs["label"] == "search_query_repair"
+            return {
+                "normalized_topic": "debiasing dynamic recommender systems",
+                "display_topic": "动态去偏推荐系统",
+                "keywords": ["debiasing", "dynamic recommendation", "recommender systems"],
+                "queries": ["debiasing dynamic recommender systems", "debiasing temporal recommendation"],
+                "source_queries": {
+                    "openalex": ["debiasing dynamic recommender systems"],
+                    "dblp": ["debiasing dynamic rec"],
+                    "arxiv": ["debiasing sequential recommendation"],
+                    "semantic_scholar": ["unbiased dynamic recommendation"],
+                    "google_scholar": ["bias mitigation temporal recommender systems"],
+                },
+                "cs_area": "AI",
+                "recent_years": 3,
+                "from_year": None,
+                "to_year": None,
+            }
+
+    intent = IntentAnalyzer(llm=QueryRepairLlm()).research_from_plan(
+        "调研一下动态去偏推荐系统近三年研究进展",
+        {
+            "normalized_topic": "动态去偏推荐系统",
+            "keywords": ["动态", "去偏", "推荐系统"],
+            "queries": ["动态去偏推荐系统"],
+            "source_queries": {"dblp": ["动态去偏推荐系统"]},
+        },
+    )
+
+    assert intent.normalized_topic == "debiasing dynamic recommender systems"
+    assert all(query.isascii() for query in intent.queries)
+    assert intent.source_queries["dblp"] == ["debiasing dynamic rec"]
+    assert intent.recent_years == 3
+
+
 class FakePdfPlanLlm(FakeUnifiedIntentLlm):
     def chat_json(self, **kwargs):
         self.calls.append(kwargs)

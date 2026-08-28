@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from paper_agent.core import assistant_engine as assistant_engine_module
-from paper_agent.core.assistant_engine import ResearchAssistantEngine, _search_source_summary, _source_query_plan
+from paper_agent.core.assistant_engine import ResearchAssistantEngine, _search_answer_summary, _search_source_summary, _source_query_plan
 from paper_agent.core.agent_runtime import IterativeAgentRuntime
 from paper_agent.core.intent import ActionIntent, IntentAnalyzer, RequestAnalysis, ResearchIntent
 from paper_agent.core.models import Paper, SearchResult
@@ -32,6 +32,22 @@ def test_search_source_summary_explains_partial_failures():
     assert "arXiv 3/3 个查询有结果" in summary
     assert "Semantic Scholar 0/3 个查询有结果，0 个空结果，1 个失败：HTTP 429 Too Many Requests" in summary
     assert "Google Scholar 未配置" in summary
+
+
+def test_empty_search_response_discloses_the_english_queries_that_were_attempted():
+    intent = ResearchIntent(
+        original_request="调研动态去偏推荐系统近三年进展",
+        normalized_topic="debiasing dynamic recommender systems",
+        cs_area="AI",
+        queries=["debiasing temporal recommendation"],
+        source_queries={"dblp": ["debiasing dynamic rec"]},
+        recent_years=3,
+    )
+
+    answer = _search_answer_summary(intent, [], "")
+
+    assert "英文检索式" in answer
+    assert "debiasing dynamic rec" in answer
 
 
 class FakeFollowUpIntentAnalyzer(FakeIntentAnalyzer):
