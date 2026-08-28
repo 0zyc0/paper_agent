@@ -21,6 +21,7 @@ OUTPUT_DIR = ROOT / "outputs"
 class ResearchAssistantHandler(BaseHTTPRequestHandler):
     engine = ResearchAssistantEngine()
     engine_lock = threading.RLock()
+    engine.store.interrupt_incomplete_jobs()
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -53,6 +54,15 @@ class ResearchAssistantHandler(BaseHTTPRequestHandler):
             snapshot = self.engine.snapshot(session_id=session_id)
             self._send_json(snapshot)
             return
+        if path == "/api/projects":
+            self._send_json({"projects": self.engine.list_projects()})
+            return
+        if path.startswith("/api/projects/"):
+            if self._handle_project_get(path, query):
+                return
+        if path.startswith("/api/jobs/"):
+            if self._handle_job_get(path, query):
+                return
         if path == "/api/discovery/feed":
             topic = query.get("topic", [""])[0]
             with self.engine_lock:
@@ -97,6 +107,15 @@ class ResearchAssistantHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/library/open-folder":
             self._handle_open_library_folder()
+            return
+        if path == "/api/projects":
+            self._handle_project_create()
+            return
+        if path.startswith("/api/projects/"):
+            if self._handle_project_post(path):
+                return
+        if path == "/api/jobs":
+            self._handle_job_create()
             return
         if path not in {"/api/chat/stream", "/api/session/clear"}:
             self.send_error(404, "Not found")
@@ -209,6 +228,118 @@ class ResearchAssistantHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": f"打开个人文献库失败：{exc}"}, status=500)
             return
         self._send_json(result, status=200 if result.get("ok") else 500)
+
+    def _read_json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            return {}
+        payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("请求体必须是 JSON 对象。")
+        return payload
+
+    def _handle_project_get(self, path: str, query: dict[str, list[str]]) -> bool:
+        parts = [part for part in path.split("/") if part]
+        if len(parts) < 4:
+            return False
+        project_id = parts[2]
+        if len(parts) == 4 and parts[3] == "drafts":
+            self._send_json({"drafts": self.engine.list_drafts(session_id=project_id)})
+            return True
+        if len(parts) >= 5 and parts[3] == "drafts":
+            draft_id = parts[4]
+            if len(parts) == 6 and parts[5] == "versions":
+                self._send_json({"versions": self.engine.draft_versions(draft_id, session_id=project_id)})
+            else:
+                draft = self.engine.get_draft(draft_id, session_id=project_id)
+                self._send_json({"draft": draft} if draft else {"error": "未找到草稿。"}, status=200 if draft else 404)
+            return True
+        return False
+
+    def _handle_project_post(self, path: str) -> bool:
+        parts = [part for part in path.split("/") if part]
+        if len(parts) < 3:
+            return False
+        project_id = parts[2]
+        try:
+            payload = self._read_json_body()
+            if len(parts) == 3:
+                project = self.engine.rename_project(project_id, str(payload.get("title") or ""))
+                self._send_json({"project": project} if project else {"error": "未找到项目。"}, status=200 if project else 404)
+                return True
+            if len(parts) >= 5 and parts[3] == "drafts":
+                draft_id = parts[4]
+                if len(parts) == 6 and parts[5] == "export":
+                    result = self.engine.export_draft(draft_id, session_id=project_id, format=str(payload.get("format") or "markdown"))
+                    self._send_json(result, status=200 if result.get("ok") else 404)
+                    return True
+                draft = self.engine.update_draft(draft_id, payload, session_id=project_id, note=str(payload.get("note") or "手动编辑"))
+                self._send_json({"draft": draft} if draft else {"error": "未找到草稿。"}, status=200 if draft else 404)
+                return True
+        except Exception as exc:
+            self._send_json({"error": f"项目操作失败：{exc}"}, status=400)
+            return True
+        return False
+
+    def _handle_project_create(self) -> None:
+        try:
+            project = self.engine.create_project(str(self._read_json_body().get("title") or "新研究项目"))
+            self._send_json({"project": project}, status=201)
+        except Exception as exc:
+            self._send_json({"error": f"创建项目失败：{exc}"}, status=400)
+
+    def _handle_job_create(self) -> None:
+        try:
+            payload = self._read_json_body()
+            project_id = str(payload.get("project_id") or payload.get("session_id") or "default")
+            message, mode = str(payload.get("message") or "").strip(), str(payload.get("mode") or "auto")
+            evidence_ids = payload.get("evidence_paper_ids") if isinstance(payload.get("evidence_paper_ids"), list) else None
+            if not message:
+                raise ValueError("请输入请求内容。")
+            self.engine._session_state(project_id)
+            job = self.engine.store.create_job(project_id, message, mode, payload={"evidence_paper_ids": evidence_ids or []})
+            threading.Thread(target=self._run_job, args=(project_id, job["id"], message, mode, evidence_ids), daemon=True).start()
+            self._send_json({"job": job}, status=202)
+        except Exception as exc:
+            self._send_json({"error": f"创建任务失败：{exc}"}, status=400)
+
+    def _run_job(self, project_id: str, job_id: str, message: str, mode: str, evidence_ids: list[str] | None) -> None:
+        result: dict = {}
+        try:
+            with self.engine_lock:
+                for event in self.engine.handle_stream(message, mode=mode, session_id=project_id, evidence_paper_ids=evidence_ids):
+                    self.engine.store.append_job_event(job_id, event)
+                    if event.get("type") == "answer":
+                        result["answer"] = event.get("content", "")
+                    if event.get("type") == "document":
+                        result["document"] = event
+                result["snapshot"] = self.engine.snapshot(session_id=project_id)
+            self.engine.store.finish_job(job_id, result=result)
+        except Exception as exc:
+            traceback.print_exc()
+            self.engine.store.append_job_event(job_id, {"type": "error", "message": f"执行失败：{exc}"})
+            self.engine.store.finish_job(job_id, result=result, error=str(exc))
+
+    def _handle_job_get(self, path: str, query: dict[str, list[str]]) -> bool:
+        parts = [part for part in path.split("/") if part]
+        if len(parts) < 3:
+            return False
+        job_id = parts[2]
+        project_id = str(query.get("project_id", query.get("session_id", ["default"]))[0] or "default")
+        if len(parts) == 3:
+            job = self.engine.store.get_job(project_id, job_id)
+            self._send_json({"job": job} if job else {"error": "未找到任务。"}, status=200 if job else 404)
+            return True
+        if len(parts) == 4 and parts[3] == "events":
+            try:
+                after_id = int(query.get("after_id", ["0"])[0] or 0)
+            except ValueError:
+                after_id = 0
+            job = self.engine.store.get_job(project_id, job_id)
+            events = self.engine.store.job_events(project_id, job_id, after_id=after_id) if job else []
+            self._send_json({"job": job, "events": events} if job else {"error": "未找到任务。"}, status=200 if job else 404)
+            return True
+        return False
 
     def log_message(self, format: str, *args) -> None:
         sys.stderr.write("[web] " + format % args + "\n")

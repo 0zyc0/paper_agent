@@ -4,9 +4,22 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+from uuid import uuid4
 
 from ..core.models import Paper, utc_now_iso
 from ..tools.search import dedupe_papers, merge_papers
+
+
+def _json_value(value: object, default):
+    try:
+        parsed = json.loads(str(value or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
+    return parsed if isinstance(parsed, type(default)) else default
+
+
+def _json_object(value: object) -> dict:
+    return _json_value(value, {})
 
 
 class SQLitePaperStore:
@@ -346,9 +359,272 @@ class SQLitePaperStore:
             "query_count": query_count,
         }
 
+    # ---- Durable workspace state -------------------------------------------------
+
+    def list_projects(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM projects ORDER BY updated_at DESC, created_at DESC").fetchall()
+        return [self._project_from_row(row) for row in rows]
+
+    def get_project(self, project_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        return self._project_from_row(row) if row else None
+
+    def create_project(self, title: str = "新研究项目", *, project_id: str | None = None, state: dict | None = None) -> dict:
+        project_id = str(project_id or uuid4().hex)
+        now = utc_now_iso()
+        name = str(title or "新研究项目").strip()[:160] or "新研究项目"
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO projects (id, title, state_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (project_id, name, json.dumps(state or {}, ensure_ascii=False), now, now),
+            )
+        return self.get_project(project_id) or {"id": project_id, "title": name, "state": state or {}}
+
+    def update_project(self, project_id: str, *, title: str | None = None, state: dict | None = None) -> dict | None:
+        current = self.get_project(project_id)
+        if not current:
+            return None
+        now = utc_now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE projects SET title = ?, state_json = ?, updated_at = ? WHERE id = ?",
+                (
+                    str(title if title is not None else current["title"]).strip()[:160] or "新研究项目",
+                    json.dumps(state if state is not None else current["state"], ensure_ascii=False),
+                    now,
+                    project_id,
+                ),
+            )
+        return self.get_project(project_id)
+
+    def delete_project(self, project_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+
+    def clear_project_workspace(self, project_id: str, *, state: dict | None = None) -> None:
+        now = utc_now_iso()
+        with self._connect() as conn:
+            conn.execute("DELETE FROM project_messages WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM project_papers WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM project_documents WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM drafts WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM jobs WHERE project_id = ?", (project_id,))
+            conn.execute("UPDATE projects SET state_json = ?, updated_at = ? WHERE id = ?", (json.dumps(state or {}, ensure_ascii=False), now, project_id))
+
+    def replace_project_papers(self, project_id: str, paper_ids: list[str], *, selected_ids: list[str] | None = None) -> None:
+        selected = set(selected_ids if selected_ids is not None else paper_ids)
+        canonical_ids = []
+        for paper_id in paper_ids:
+            canonical = self.resolve_paper_id(paper_id)
+            if canonical and canonical not in canonical_ids:
+                canonical_ids.append(canonical)
+        now = utc_now_iso()
+        with self._connect() as conn:
+            conn.execute("DELETE FROM project_papers WHERE project_id = ?", (project_id,))
+            conn.executemany(
+                "INSERT INTO project_papers (project_id, paper_id, selected, added_at) VALUES (?, ?, ?, ?)",
+                [(project_id, paper_id, 1 if paper_id in selected else 0, now) for paper_id in canonical_ids],
+            )
+
+    def project_paper_ids(self, project_id: str) -> tuple[list[str], list[str]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT paper_id, selected FROM project_papers WHERE project_id = ? ORDER BY added_at", (project_id,)
+            ).fetchall()
+        paper_ids = [str(row["paper_id"]) for row in rows]
+        selected_ids = [str(row["paper_id"]) for row in rows if row["selected"]]
+        return paper_ids, selected_ids
+
+    def replace_project_documents(self, project_id: str, documents: list[dict]) -> None:
+        now = utc_now_iso()
+        with self._connect() as conn:
+            conn.execute("DELETE FROM project_documents WHERE project_id = ?", (project_id,))
+            conn.executemany(
+                "INSERT INTO project_documents (id, project_id, name, path, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        str(document.get("id") or uuid4().hex), project_id,
+                        str(document.get("name") or "uploaded-paper.pdf"), str(document.get("path") or ""),
+                        json.dumps(document, ensure_ascii=False), now,
+                    )
+                    for document in documents
+                ],
+            )
+
+    def project_documents(self, project_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM project_documents WHERE project_id = ? ORDER BY created_at", (project_id,)
+            ).fetchall()
+        return [_json_object(row["payload_json"]) for row in rows]
+
+    def append_project_message(self, project_id: str, role: str, content: str, *, message_id: str | None = None) -> None:
+        if not content.strip():
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO project_messages (id, project_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                (message_id or uuid4().hex, project_id, role, content, utc_now_iso()),
+            )
+
+    def project_messages(self, project_id: str, *, limit: int = 240) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT role, content, created_at FROM project_messages WHERE project_id = ? ORDER BY created_at DESC LIMIT ?",
+                (project_id, max(1, limit)),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def create_draft(self, project_id: str, payload: dict, *, draft_id: str | None = None) -> dict:
+        draft_id = draft_id or uuid4().hex
+        now = utc_now_iso()
+        title = str(payload.get("title") or "未命名草稿").strip() or "未命名草稿"
+        content = str(payload.get("content_markdown") or payload.get("content") or "")
+        bibtex = str(payload.get("bibtex") or "")
+        values = (
+            draft_id, project_id, title, str(payload.get("writing_kind") or "report"), content, bibtex,
+            json.dumps(payload.get("claim_map") or [], ensure_ascii=False),
+            json.dumps(payload.get("paper_ids") or [], ensure_ascii=False),
+            json.dumps(payload.get("outline") or [], ensure_ascii=False),
+            json.dumps(payload.get("quality_report") or {}, ensure_ascii=False), 1, now, now,
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO drafts (id, project_id, title, writing_kind, content_markdown, bibtex, claim_map_json,
+                   paper_ids_json, outline_json, quality_report_json, version, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                values,
+            )
+            conn.execute(
+                "INSERT INTO draft_versions (id, draft_id, version, content_markdown, bibtex, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (uuid4().hex, draft_id, 1, content, bibtex, "生成初稿", now),
+            )
+        return self.get_draft(project_id, draft_id) or {}
+
+    def list_drafts(self, project_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM drafts WHERE project_id = ? ORDER BY updated_at DESC", (project_id,)).fetchall()
+        return [self._draft_from_row(row, include_content=False) for row in rows]
+
+    def get_draft(self, project_id: str, draft_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM drafts WHERE project_id = ? AND id = ?", (project_id, draft_id)).fetchone()
+        return self._draft_from_row(row, include_content=True) if row else None
+
+    def update_draft(self, project_id: str, draft_id: str, payload: dict, *, note: str = "手动编辑") -> dict | None:
+        current = self.get_draft(project_id, draft_id)
+        if not current:
+            return None
+        content = str(payload.get("content_markdown", current["content_markdown"]))
+        bibtex = str(payload.get("bibtex", current["bibtex"]))
+        title = str(payload.get("title", current["title"])).strip() or current["title"]
+        kind = str(payload.get("writing_kind", current["writing_kind"])) or current["writing_kind"]
+        changed = content != current["content_markdown"] or bibtex != current["bibtex"]
+        version = current["version"] + 1 if changed else current["version"]
+        now = utc_now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE drafts SET title = ?, writing_kind = ?, content_markdown = ?, bibtex = ?, version = ?, updated_at = ? WHERE id = ?",
+                (title, kind, content, bibtex, version, now, draft_id),
+            )
+            if changed:
+                conn.execute(
+                    "INSERT INTO draft_versions (id, draft_id, version, content_markdown, bibtex, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (uuid4().hex, draft_id, version, content, bibtex, str(note or "手动编辑"), now),
+                )
+        return self.get_draft(project_id, draft_id)
+
+    def draft_versions(self, project_id: str, draft_id: str) -> list[dict]:
+        if not self.get_draft(project_id, draft_id):
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT version, content_markdown, bibtex, note, created_at FROM draft_versions WHERE draft_id = ? ORDER BY version DESC",
+                (draft_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_job(self, project_id: str, request: str, mode: str, *, payload: dict | None = None) -> dict:
+        job_id, now = uuid4().hex, utc_now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO jobs (id, project_id, request, mode, payload_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)",
+                (job_id, project_id, request, mode, json.dumps(payload or {}, ensure_ascii=False), now, now),
+            )
+        return self.get_job(project_id, job_id) or {}
+
+    def append_job_event(self, job_id: str, event: dict) -> int:
+        now = utc_now_iso()
+        with self._connect() as conn:
+            cursor = conn.execute("INSERT INTO job_events (job_id, event_json, created_at) VALUES (?, ?, ?)", (job_id, json.dumps(event, ensure_ascii=False), now))
+            conn.execute("UPDATE jobs SET status = 'running', updated_at = ? WHERE id = ?", (now, job_id))
+        return int(cursor.lastrowid)
+
+    def finish_job(self, job_id: str, *, result: dict | None = None, error: str = "") -> None:
+        now = utc_now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, result_json = ?, error = ?, updated_at = ?, finished_at = ? WHERE id = ?",
+                ("failed" if error else "completed", json.dumps(result or {}, ensure_ascii=False), error, now, now, job_id),
+            )
+
+    def get_job(self, project_id: str, job_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE id = ? AND project_id = ?", (job_id, project_id)).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        data["result"] = _json_object(data.pop("result_json", "{}"))
+        data["payload"] = _json_object(data.pop("payload_json", "{}"))
+        return data
+
+    def interrupt_incomplete_jobs(self, *, reason: str = "服务重启，未完成任务已中断；请重新提交请求。") -> int:
+        """Mark stale in-process work instead of leaving the UI polling forever."""
+        now = utc_now_iso()
+        event = json.dumps({"type": "error", "message": reason, "recoverable": True}, ensure_ascii=False)
+        with self._connect() as conn:
+            rows = conn.execute("SELECT id FROM jobs WHERE status IN ('queued', 'running')").fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE jobs SET status = 'interrupted', error = ?, updated_at = ?, finished_at = ? WHERE id = ?",
+                    (reason, now, now, row["id"]),
+                )
+                conn.execute("INSERT INTO job_events (job_id, event_json, created_at) VALUES (?, ?, ?)", (row["id"], event, now))
+        return len(rows)
+
+    def job_events(self, project_id: str, job_id: str, *, after_id: int = 0) -> list[dict]:
+        if not self.get_job(project_id, job_id):
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, event_json, created_at FROM job_events WHERE job_id = ? AND id > ? ORDER BY id", (job_id, max(0, after_id))
+            ).fetchall()
+        return [{"id": row["id"], "event": _json_object(row["event_json"]), "created_at": row["created_at"]} for row in rows]
+
+    @staticmethod
+    def _project_from_row(row: sqlite3.Row) -> dict:
+        data = dict(row)
+        data["state"] = _json_object(data.pop("state_json", "{}"))
+        return data
+
+    @staticmethod
+    def _draft_from_row(row: sqlite3.Row, *, include_content: bool) -> dict:
+        data = dict(row)
+        data["claim_map"] = _json_value(data.pop("claim_map_json", "[]"), [])
+        data["paper_ids"] = _json_value(data.pop("paper_ids_json", "[]"), [])
+        data["outline"] = _json_value(data.pop("outline_json", "[]"), [])
+        data["quality_report"] = _json_object(data.pop("quality_report_json", "{}"))
+        if not include_content:
+            data.pop("content_markdown", None)
+            data.pop("bibtex", None)
+        return data
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def _init_db(self) -> None:
@@ -429,6 +705,120 @@ class SQLitePaperStore:
                 )
                 """
             )
+            # Workspace state is deliberately stored alongside the literature
+            # index.  Browser localStorage is only a cache; projects, messages,
+            # selected papers, drafts and task history must survive restarts.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS projects (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    state_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS project_messages (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS project_papers (
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                    selected INTEGER NOT NULL DEFAULT 1,
+                    added_at TEXT NOT NULL,
+                    PRIMARY KEY (project_id, paper_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS project_documents (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS drafts (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    writing_kind TEXT NOT NULL,
+                    content_markdown TEXT NOT NULL,
+                    bibtex TEXT NOT NULL DEFAULT '',
+                    claim_map_json TEXT NOT NULL DEFAULT '[]',
+                    paper_ids_json TEXT NOT NULL DEFAULT '[]',
+                    outline_json TEXT NOT NULL DEFAULT '[]',
+                    quality_report_json TEXT NOT NULL DEFAULT '{}',
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS draft_versions (
+                    id TEXT PRIMARY KEY,
+                    draft_id TEXT NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+                    version INTEGER NOT NULL,
+                    content_markdown TEXT NOT NULL,
+                    bibtex TEXT NOT NULL DEFAULT '',
+                    note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(draft_id, version)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    request TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL,
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    finished_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS job_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                    event_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_project_messages_project_created ON project_messages(project_id, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_project_papers_project ON project_papers(project_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_drafts_project_updated ON drafts(project_id, updated_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_project_updated ON jobs(project_id, updated_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_job_events_job_id ON job_events(job_id, id)")
+            self._ensure_column(conn, "jobs", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_aliases_canonical ON paper_id_aliases(paper_id)")
 
     def _ensure_paper_columns(self, conn: sqlite3.Connection) -> None:
@@ -467,6 +857,12 @@ class SQLitePaperStore:
         now = utc_now_iso()
         conn.execute("UPDATE papers SET added_at = COALESCE(added_at, retrieved_at, ?)", (now,))
         conn.execute("UPDATE papers SET updated_at = COALESCE(updated_at, last_seen_at, retrieved_at, ?)", (now,))
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        columns = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _paper_values(self, paper: Paper, now: str) -> tuple:
         return (

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-import re
 from urllib.parse import quote_plus
 
 from ..tools.llm import KimiClient
@@ -551,14 +550,6 @@ The agent will search DBLP, arXiv, and Google Scholar. Return JSON only.
             source="safe_default",
         )
 
-    def _analyze_action_with_rules(self, request: str, *, has_papers: bool) -> ActionIntent:
-        return ActionIntent(request, "chat", "启发式动作路由已停用；请使用 Kimi 结构化路由。", 0.0, "safe_chat")
-
-    def _analyze_with_rules(self, request: str) -> ResearchIntent:
-        """Compatibility shim; heuristic intent extraction is intentionally disabled."""
-        return self._safe_research_intent(request)
-
-
 def _is_request_echo(topic: str, request: str) -> bool:
     """Detect only the exact malformed planner shape, without interpreting text."""
     normalized_topic = normalize_text(topic).casefold()
@@ -598,7 +589,7 @@ def _clean_venue_ranks(value) -> list[str]:
     }
     ranks = []
     for item in _clean_list(value):
-        key = re.sub(r"[^a-z0-9-]+", "", item.lower())
+        key = "".join(character for character in item.lower() if character.isascii() and (character.isalnum() or character == "-"))
         rank = allowed.get(key)
         if rank and rank not in ranks:
             ranks.append(rank)

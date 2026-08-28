@@ -258,3 +258,44 @@ def test_sqlite_store_dedupes_existing_rows_and_repoints_queries(tmp_path):
         query_paper_ids = {row[0] for row in conn.execute("SELECT paper_id FROM paper_queries").fetchall()}
     assert query_paper_ids == {papers[0].id}
     assert store.resolve_paper_id("manual_duplicate_id") == papers[0].id
+
+
+def test_sqlite_store_persists_project_messages_selection_drafts_versions_and_jobs(tmp_path):
+    store = SQLitePaperStore(tmp_path / "papers.sqlite")
+    project = store.create_project("去偏推荐项目", project_id="project-1", state={"research_topics": ["debiasing recommender systems"]})
+    paper = Paper(title="Debiasing Recommendation", authors=["Ada Lovelace"], year=2026, source="dblp")
+    store.save_papers([paper])
+    store.replace_project_papers(project["id"], [paper.id], selected_ids=[paper.id])
+    store.append_project_message(project["id"], "user", "基于当前证据写引言")
+    draft = store.create_draft(project["id"], {
+        "title": "引言", "writing_kind": "introduction", "content_markdown": "# 引言\n\n第一版", "bibtex": "@article{a}",
+        "paper_ids": [paper.id],
+    })
+    updated = store.update_draft(project["id"], draft["id"], {"content_markdown": "# 引言\n\n第二版"}, note="测试编辑")
+    job = store.create_job(project["id"], "写引言", "auto", payload={"evidence_paper_ids": [paper.id]})
+    event_id = store.append_job_event(job["id"], {"type": "status", "message": "正在写作"})
+    store.finish_job(job["id"], result={"answer": "完成"})
+
+    reopened = SQLitePaperStore(tmp_path / "papers.sqlite")
+    assert reopened.get_project(project["id"])["state"]["research_topics"] == ["debiasing recommender systems"]
+    assert reopened.project_paper_ids(project["id"])[1] == [paper.id]
+    assert reopened.project_messages(project["id"])[0]["content"] == "基于当前证据写引言"
+    assert reopened.get_draft(project["id"], draft["id"])["content_markdown"].endswith("第二版")
+    assert [item["version"] for item in reopened.draft_versions(project["id"], draft["id"])] == [2, 1]
+    assert reopened.get_job(project["id"], job["id"])["payload"]["evidence_paper_ids"] == [paper.id]
+    assert reopened.job_events(project["id"], job["id"], after_id=event_id - 1)[0]["event"]["message"] == "正在写作"
+
+
+def test_sqlite_store_marks_stale_jobs_interrupted_after_service_restart(tmp_path):
+    store = SQLitePaperStore(tmp_path / "papers.sqlite")
+    project = store.create_project("恢复测试", project_id="project-recovery")
+    job = store.create_job(project["id"], "生成研究报告", "auto")
+    store.append_job_event(job["id"], {"type": "status", "message": "正在生成"})
+
+    assert store.interrupt_incomplete_jobs() == 1
+
+    restored = store.get_job(project["id"], job["id"])
+    assert restored is not None
+    assert restored["status"] == "interrupted"
+    assert "服务重启" in restored["error"]
+    assert store.job_events(project["id"], job["id"])[-1]["event"]["recoverable"] is True

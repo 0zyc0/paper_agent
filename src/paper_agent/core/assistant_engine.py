@@ -779,12 +779,16 @@ class ResearchAssistantEngine:
         # otherwise refreshing the UI can contend with a long-running stream.
         state = self._session_state(session_id)
         return {
+            "project": self.store.get_project(_clean_session_id(session_id)),
             "papers": self._paper_payloads(state.papers),
             "intent": self._intent_payload(state.last_intent) if state.last_intent else None,
             "generated_files": state.generated_files,
             "last_generated_document": state.last_generated_document,
             "evidence_paper_ids": state.evidence_paper_ids,
             "conversation_turns": len(state.conversation_history),
+            # Browser storage is only a cache. Return persisted history so a
+            # refresh or service restart can rebuild the conversation.
+            "messages": state.conversation_history,
             "research_topics": state.research_topics,
             "uploaded_documents": [document.to_payload() for document in state.uploaded_documents],
             "debug": state.last_debug,
@@ -809,6 +813,43 @@ class ResearchAssistantEngine:
                 ],
             },
         }
+
+    def list_projects(self) -> list[dict]:
+        return self.store.list_projects()
+
+    def create_project(self, title: str = "新研究项目") -> dict:
+        project = self.store.create_project(title, state=_assistant_state_to_dict(AssistantState()))
+        self.sessions[str(project["id"])] = AssistantState()
+        return project
+
+    def rename_project(self, project_id: str, title: str) -> dict | None:
+        state = self._session_state(project_id)
+        return self.store.update_project(_clean_session_id(project_id), title=title, state=_assistant_state_to_dict(state))
+
+    def list_drafts(self, *, session_id: str = "default") -> list[dict]:
+        return self.store.list_drafts(_clean_session_id(session_id))
+
+    def get_draft(self, draft_id: str, *, session_id: str = "default") -> dict | None:
+        return self.store.get_draft(_clean_session_id(session_id), draft_id)
+
+    def update_draft(self, draft_id: str, payload: dict, *, session_id: str = "default", note: str = "手动编辑") -> dict | None:
+        return self.store.update_draft(_clean_session_id(session_id), draft_id, payload, note=note)
+
+    def draft_versions(self, draft_id: str, *, session_id: str = "default") -> list[dict]:
+        return self.store.draft_versions(_clean_session_id(session_id), draft_id)
+
+    def export_draft(self, draft_id: str, *, session_id: str = "default", format: str = "markdown") -> dict:
+        draft = self.get_draft(draft_id, session_id=session_id)
+        if not draft:
+            return {"ok": False, "error": "未找到草稿。"}
+        safe_title = re.sub(r"[^A-Za-z0-9._-]+", "_", draft["title"]).strip("_") or "draft"
+        if format == "bibtex":
+            suffix, content, kind = ".bib", draft.get("bibtex") or "", "bibtex"
+        else:
+            suffix, content, kind = ".md", draft.get("content_markdown") or "", "markdown"
+        path = self.output_dir / f"{safe_title}_v{draft['version']}{suffix}"
+        path.write_text(content, encoding="utf-8")
+        return {"ok": True, "file": {"name": path.name, "url": f"/outputs/{path.name}", "kind": kind}}
 
     def update_paper_asset_state(self, paper_id: str, updates: dict, *, session_id: str = "default") -> dict:
         self.state = self._session_state(session_id)
@@ -935,6 +976,7 @@ class ResearchAssistantEngine:
                 except OSError:
                     pass
         self.sessions[clean_id] = AssistantState()
+        self.store.clear_project_workspace(clean_id, state=_assistant_state_to_dict(self.sessions[clean_id]))
         if clean_id == "default":
             self.state = self.sessions[clean_id]
         self._persist_sessions()
@@ -943,10 +985,42 @@ class ResearchAssistantEngine:
         clean_id = _clean_session_id(session_id)
         if clean_id not in self.sessions:
             self.sessions[clean_id] = AssistantState()
+        if not self.store.get_project(clean_id):
+            self.store.create_project(
+                "新研究项目" if clean_id == "default" else "研究项目",
+                project_id=clean_id,
+                state=_assistant_state_to_dict(self.sessions[clean_id]),
+            )
         return self.sessions[clean_id]
 
     def _load_sessions(self) -> None:
+        # SQLite is the primary source of truth. Import sessions.json only for
+        # existing installations that predate durable project storage.
+        projects = self.store.list_projects()
+        if projects:
+            restored: dict[str, AssistantState] = {}
+            for project in projects:
+                project_id = str(project["id"])
+                state = _assistant_state_from_dict(project.get("state") or {})
+                paper_ids, selected_ids = self.store.project_paper_ids(project_id)
+                if paper_ids:
+                    wanted = set(paper_ids)
+                    state.papers = [paper for paper in self.store.load_papers() if paper.id in wanted]
+                    state.evidence_paper_ids = selected_ids
+                documents = self.store.project_documents(project_id)
+                if documents:
+                    state.uploaded_documents = [_uploaded_document_from_dict(item) for item in documents]
+                messages = self.store.project_messages(project_id)
+                if messages:
+                    state.conversation_history = [
+                        {"role": item["role"], "content": item["content"]} for item in messages
+                    ][-28:]
+                restored[project_id] = state
+            self.sessions = restored
+            self.state = self.sessions.get("default") or next(iter(self.sessions.values()))
+            return
         if not self.session_store_path.exists():
+            self.store.create_project("新研究项目", project_id="default", state=_assistant_state_to_dict(self.state))
             return
         try:
             data = json.loads(self.session_store_path.read_text(encoding="utf-8"))
@@ -961,10 +1035,34 @@ class ResearchAssistantEngine:
             if restored:
                 self.sessions = restored
                 self.state = self.sessions.get("default") or next(iter(self.sessions.values()))
+                self._persist_sessions()
         except Exception:
             self.sessions = {"default": self.state}
 
     def _persist_sessions(self) -> None:
+        for session_id, state in self.sessions.items():
+            project = self.store.get_project(session_id)
+            title = project.get("title") if project else ("新研究项目" if session_id == "default" else "研究项目")
+            if project:
+                self.store.update_project(session_id, title=title, state=_assistant_state_to_dict(state))
+            else:
+                self.store.create_project(title, project_id=session_id, state=_assistant_state_to_dict(state))
+            self.store.replace_project_papers(
+                session_id,
+                [paper.id for paper in state.papers if paper.id],
+                selected_ids=state.evidence_paper_ids,
+            )
+            self.store.replace_project_documents(
+                session_id,
+                [_uploaded_document_to_dict(document) for document in state.uploaded_documents],
+            )
+            # Migrate the old JSON history exactly once. New turns are inserted
+            # incrementally in _remember_conversation.
+            if not self.store.project_messages(session_id, limit=1):
+                for message in state.conversation_history:
+                    self.store.append_project_message(
+                        session_id, str(message.get("role") or "assistant"), str(message.get("content") or "")
+                    )
         payload = {
             "version": 1,
             "sessions": {
@@ -1712,6 +1810,22 @@ class ResearchAssistantEngine:
             "quality_report": draft.quality_report,
             "evidence_report": evidence_report,
         }
+        project_id = next((key for key, state in self.sessions.items() if state is self.state), "default")
+        persisted_draft = self.store.create_draft(
+            project_id,
+            {
+                "title": draft.title,
+                "writing_kind": draft.writing_kind,
+                "content_markdown": draft.content_markdown,
+                "bibtex": draft.bibtex,
+                "claim_map": draft.claim_map,
+                "paper_ids": draft.paper_ids,
+                "outline": draft.outline,
+                "quality_report": draft.quality_report,
+            },
+        )
+        document["draft_id"] = persisted_draft.get("id")
+        document["draft_version"] = persisted_draft.get("version", 1)
         self.state.last_generated_document = document
         return document
 
@@ -1908,6 +2022,19 @@ Examples:
                 "warnings": [] if selected else ["没有找到与请求直接相关的 PDF 页面，草稿需要人工核对。"],
             },
         }
+        project_id = next((key for key, state in self.sessions.items() if state is self.state), "default")
+        persisted_draft = self.store.create_draft(
+            project_id,
+            {
+                "title": document["title"],
+                "writing_kind": document["writing_kind"],
+                "content_markdown": content,
+                "outline": [],
+                "quality_report": document["quality_report"],
+            },
+        )
+        document["draft_id"] = persisted_draft.get("id")
+        document["draft_version"] = persisted_draft.get("version", 1)
         self.state.last_generated_document = document
         return document
 
@@ -1917,6 +2044,8 @@ Examples:
             return
         self.state.conversation_history.append({"role": role, "content": text[:5000]})
         self.state.conversation_history = self.state.conversation_history[-28:]
+        project_id = next((key for key, state in self.sessions.items() if state is self.state), "default")
+        self.store.append_project_message(project_id, role, text[:5000])
 
     def _remember_research_topic(self, topic: str, display_topic: str = "") -> None:
         topic = normalize_text(topic)

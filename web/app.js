@@ -40,6 +40,12 @@ const elements = {
   draftMeta: $("#draftMeta"),
   draftPreview: $("#draftPreview"),
   fileList: $("#fileList"),
+  draftSelect: $("#draftSelect"),
+  draftVersionSelect: $("#draftVersionSelect"),
+  draftEditor: $("#draftEditor"),
+  saveDraft: $("#saveDraftBtn"),
+  exportMarkdown: $("#exportMarkdownBtn"),
+  exportBibtex: $("#exportBibtexBtn"),
   topicList: $("#topicList"),
   feedList: $("#feedList"),
   directionList: $("#directionList"),
@@ -70,7 +76,7 @@ function makeSession() {
     messages: [], papers: [], selectedPaperIds: [], files: [], intent: null,
     lastAction: "", lastGeneratedDocument: null, lastAnswer: "", debug: null,
     uploadedDocuments: [], readerDocumentId: "", taskState: "", taskLog: [], processVisible: false,
-    discovery: null, discoveryLoading: false, researchTopics: [],
+    discovery: null, discoveryLoading: false, researchTopics: [], drafts: [], activeDraftId: "", activeDraft: null, draftVersions: [], activeDraftVersion: 0,
   };
 }
 
@@ -84,6 +90,8 @@ function normalizeSession(session) {
   session.discoveryLoading = Boolean(session.discoveryLoading);
   session.researchTopics = Array.isArray(session.researchTopics) ? session.researchTopics : [];
   session.taskLog = Array.isArray(session.taskLog) ? session.taskLog : [];
+  session.drafts = Array.isArray(session.drafts) ? session.drafts : [];
+  session.draftVersions = Array.isArray(session.draftVersions) ? session.draftVersions : [];
   session.selectedPaperIds = Array.isArray(session.selectedPaperIds)
     ? session.selectedPaperIds
     : session.papers.map((paper) => paper.id).filter(Boolean);
@@ -448,7 +456,7 @@ function renderReader(session) {
 
 function renderWriting(session) {
   const topic = session.intent?.display_topic || session.intent?.normalized_topic || "当前研究主题";
-  const draft = session.lastGeneratedDocument;
+  const draft = session.activeDraft || session.lastGeneratedDocument;
   const lines = [
     `${topic} 的研究背景、问题和范围`,
     `基于 ${session.selectedPaperIds.length} 篇证据论文组织研究脉络`,
@@ -457,12 +465,27 @@ function renderWriting(session) {
   const outline = Array.isArray(draft?.outline) && draft.outline.length ? draft.outline : lines;
   elements.outline.innerHTML = outline.map((line) => `<li>${escapeHtml(line)}</li>`).join("");
   elements.draftEvidence.textContent = `${session.selectedPaperIds.length} 篇证据`;
+  const drafts = Array.isArray(session.drafts) ? session.drafts : [];
+  elements.draftSelect.innerHTML = drafts.length
+    ? drafts.map((item) => `<option value="${escapeAttr(item.id)}"${item.id === session.activeDraftId ? " selected" : ""}>${escapeHtml(item.title || "未命名草稿")} · v${item.version || 1}</option>`).join("")
+    : `<option value="">暂无草稿</option>`;
+  elements.draftSelect.disabled = !drafts.length;
+  const versions = Array.isArray(session.draftVersions) ? session.draftVersions : [];
+  elements.draftVersionSelect.innerHTML = versions.length
+    ? versions.map((item) => `<option value="${escapeAttr(String(item.version))}"${Number(item.version) === Number(session.activeDraftVersion || draft?.version) ? " selected" : ""}>版本 ${escapeHtml(String(item.version))} · ${escapeHtml(item.note || "保存")}</option>`).join("")
+    : `<option value="">版本 -</option>`;
+  elements.draftVersionSelect.disabled = !versions.length;
+  elements.saveDraft.disabled = !session.activeDraftId;
+  elements.exportMarkdown.disabled = !session.activeDraftId;
+  elements.exportBibtex.disabled = !session.activeDraftId;
   if (!draft) {
     elements.draftTitle.textContent = "尚未生成草稿";
     elements.draftMeta.textContent = "生成后将显示文档类型、引用覆盖和证据强度。";
     elements.draftMeta.classList.add("muted");
     elements.draftPreview.textContent = "生成内容会以可追溯的草稿形式出现在这里。";
     elements.draftPreview.classList.add("muted");
+    elements.draftEditor.value = "";
+    elements.draftEditor.disabled = true;
   } else {
     elements.draftTitle.textContent = draft.title || "最新写作草稿";
     elements.draftMeta.classList.remove("muted");
@@ -470,6 +493,10 @@ function renderWriting(session) {
     elements.draftPreview.classList.remove("muted");
     elements.draftPreview.innerHTML = renderRichText(draft.preview_markdown || draft.preview || "草稿已生成，请从下方文件打开完整内容。");
     typesetMath(elements.draftPreview);
+    elements.draftEditor.disabled = !session.activeDraftId;
+    if (document.activeElement !== elements.draftEditor) {
+      elements.draftEditor.value = draft.content_markdown || draft.preview_markdown || draft.preview || "";
+    }
   }
   if (!session.files.length) {
     elements.fileList.textContent = "暂无生成文件";
@@ -651,18 +678,30 @@ async function sendMessage(message) {
   let receivedOutput = false;
   let receivedError = false;
   try {
-    await window.paperApi.chat.stream({
+    const created = await window.paperApi.jobs.create({
+      project_id: sessionId,
       message,
-      sessionId,
-      evidencePaperIds: session.selectedPaperIds,
-      onEvent: (event) => {
+      mode: "auto",
+      evidence_paper_ids: session.selectedPaperIds,
+    });
+    const jobId = created.job?.id;
+    if (!jobId) throw new Error("服务端没有创建任务。");
+    let afterId = 0;
+    while (true) {
+      const payload = await window.paperApi.jobs.events(sessionId, jobId, afterId);
+      for (const item of payload.events || []) {
+        afterId = Math.max(afterId, Number(item.id || 0));
+        const event = item.event || {};
         if ((event.type === "answer" && String(event.content || "").trim()) || event.type === "answer_delta") receivedOutput = true;
         if (event.type === "document") receivedOutput = true;
         if (event.type === "papers" && Array.isArray(event.papers) && event.papers.length > 0) receivedOutput = true;
         if (event.type === "error") receivedError = true;
         handleEvent(event, sessionId);
-      },
-    });
+      }
+      const status = payload.job?.status;
+      if (["completed", "failed", "interrupted"].includes(status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 650));
+    }
     session.taskState = "";
     if (receivedError) {
       session.processVisible = false;
@@ -958,7 +997,9 @@ function handleEvent(event, sessionId) {
     session.processVisible = false;
     session.files = [...(event.files || []), ...session.files];
     session.lastGeneratedDocument = event;
+    session.activeDraftId = event.draft_id || session.activeDraftId;
     addTaskStep(session, "document", "写作", `已生成 ${event.title || "写作草稿"} 和 ${event.files?.length || 0} 个文件。`);
+    refreshDrafts(sessionId, event.draft_id || "");
   } else if (event.type === "answer_start") {
     session.streamingAnswer = { content: "" };
   } else if (event.type === "answer_delta") {
@@ -989,6 +1030,71 @@ function handleEvent(event, sessionId) {
   if (sessionId === state.activeSessionId) render();
 }
 
+async function refreshDrafts(sessionId = state.activeSessionId, preferredDraftId = "") {
+  try {
+    const payload = await window.paperApi.writing.drafts(sessionId);
+    const session = sessionById(sessionId);
+    if (!session) return;
+    session.drafts = payload.drafts || [];
+    const wanted = preferredDraftId || session.activeDraftId || session.drafts[0]?.id || "";
+    if (wanted) await loadDraft(sessionId, wanted);
+    else if (sessionId === state.activeSessionId) renderWriting(session);
+  } catch (error) {
+    if (sessionId === state.activeSessionId) setStatus(`草稿加载失败：${error.message || error}`);
+  }
+}
+
+async function loadDraft(sessionId, draftId, version = 0) {
+  try {
+    const [draftPayload, versionsPayload] = await Promise.all([
+      window.paperApi.writing.draft(sessionId, draftId),
+      window.paperApi.writing.versions(sessionId, draftId),
+    ]);
+    const session = sessionById(sessionId);
+    if (!session) return;
+    const draft = draftPayload.draft;
+    const versions = versionsPayload.versions || [];
+    const selectedVersion = Number(version || draft.version || 0);
+    const historical = versions.find((item) => Number(item.version) === selectedVersion);
+    session.activeDraftId = draftId;
+    session.activeDraftVersion = selectedVersion;
+    session.draftVersions = versions;
+    session.activeDraft = historical ? { ...draft, content_markdown: historical.content_markdown, bibtex: historical.bibtex, version: historical.version } : draft;
+    saveState();
+    if (sessionId === state.activeSessionId) renderWriting(session);
+  } catch (error) {
+    appendMessage("assistant error", `草稿读取失败：${error.message || error}`, sessionId);
+  }
+}
+
+async function saveActiveDraft() {
+  const session = activeSession();
+  if (!session.activeDraftId) return;
+  try {
+    const payload = await window.paperApi.writing.update(session.id, session.activeDraftId, {
+      content_markdown: elements.draftEditor.value,
+      note: "网页编辑保存",
+    });
+    session.activeDraft = payload.draft;
+    session.activeDraftVersion = payload.draft.version;
+    await refreshDrafts(session.id, session.activeDraftId);
+    setStatus(`草稿已保存为版本 ${payload.draft.version}`);
+  } catch (error) {
+    appendMessage("assistant error", `草稿保存失败：${error.message || error}`, session.id);
+  }
+}
+
+async function exportActiveDraft(format) {
+  const session = activeSession();
+  if (!session.activeDraftId) return;
+  try {
+    const payload = await window.paperApi.writing.export(session.id, session.activeDraftId, format);
+    if (payload.file?.url) window.open(payload.file.url, "_blank", "noopener");
+  } catch (error) {
+    appendMessage("assistant error", `导出失败：${error.message || error}`, session.id);
+  }
+}
+
 async function fetchState(sessionId = state.activeSessionId) {
   try {
     const snapshot = await window.paperApi.session.snapshot(sessionId);
@@ -1001,6 +1107,8 @@ async function fetchState(sessionId = state.activeSessionId) {
     session.debug = snapshot.debug || session.debug;
     session.uploadedDocuments = snapshot.uploaded_documents || session.uploadedDocuments;
     session.researchTopics = snapshot.research_topics || session.researchTopics;
+    if (Array.isArray(snapshot.messages)) session.messages = snapshot.messages;
+    if (snapshot.project?.title) session.title = snapshot.project.title;
     const hasEvidenceIds = Object.prototype.hasOwnProperty.call(snapshot, "evidence_paper_ids");
     syncSelectedPaperIds(session, hasEvidenceIds ? snapshot.evidence_paper_ids : null, { selectAllIfEmpty: !hasEvidenceIds });
     saveState();
@@ -1062,14 +1170,21 @@ async function fetchDiscovery(force = false) {
   }
 }
 
-function createSession() {
-  const session = makeSession();
-  state.sessions.unshift(session);
-  state.activeSessionId = session.id;
-  saveState();
-  setView("workbench");
-  syncActiveTaskUi();
-  setStatus("已新建项目");
+async function createSession() {
+  try {
+    const payload = await window.paperApi.projects.create({ title: "新研究项目" });
+    const project = payload.project;
+    const session = normalizeSession({ ...makeSession(), id: project.id, title: project.title });
+    state.sessions.unshift(session);
+    state.activeSessionId = session.id;
+    saveState();
+    setView("workbench");
+    syncActiveTaskUi();
+    setStatus("已新建项目");
+    await fetchState(session.id);
+  } catch (error) {
+    setStatus(`新建项目失败：${error.message || error}`);
+  }
 }
 
 function switchSession(sessionId) {
@@ -1085,6 +1200,7 @@ function renameUntitledSession(message) {
   if (session.title !== "新研究项目") return;
   session.title = message.replace(/\s+/g, " ").slice(0, 24) || "新研究项目";
   saveState();
+  window.paperApi.projects.rename(session.id, { title: session.title }).catch(() => {});
 }
 
 function actionLabel(action) {
@@ -1303,6 +1419,17 @@ elements.documentList.addEventListener("click", (event) => {
   saveState();
   renderReader(activeSession());
 });
+elements.draftSelect.addEventListener("change", () => {
+  const draftId = elements.draftSelect.value;
+  if (draftId) loadDraft(state.activeSessionId, draftId);
+});
+elements.draftVersionSelect.addEventListener("change", () => {
+  const session = activeSession();
+  if (session.activeDraftId) loadDraft(session.id, session.activeDraftId, Number(elements.draftVersionSelect.value || 0));
+});
+elements.saveDraft.addEventListener("click", saveActiveDraft);
+elements.exportMarkdown.addEventListener("click", () => exportActiveDraft("markdown"));
+elements.exportBibtex.addEventListener("click", () => exportActiveDraft("bibtex"));
 elements.fileList.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-preview-file]");
   if (!button) return;
@@ -1335,8 +1462,34 @@ document.querySelectorAll(".prompt-action").forEach((button) => button.addEventL
   elements.input.focus();
 }));
 
-loadState();
-setView(state.activeView);
-syncActiveTaskUi();
-render();
-fetchState();
+async function bootstrap() {
+  loadState();
+  try {
+    const payload = await window.paperApi.projects.list();
+    const projects = payload.projects || [];
+    if (projects.length) {
+      const local = new Map(state.sessions.map((session) => [session.id, session]));
+      state.sessions = projects.map((project) => normalizeSession({
+        ...makeSession(),
+        ...(local.get(project.id) || {}),
+        id: project.id,
+        title: project.title,
+      }));
+      if (!state.sessions.some((session) => session.id === state.activeSessionId)) state.activeSessionId = state.sessions[0].id;
+    } else {
+      const created = await window.paperApi.projects.create({ title: "新研究项目" });
+      state.sessions = [normalizeSession({ ...makeSession(), id: created.project.id, title: created.project.title })];
+      state.activeSessionId = created.project.id;
+    }
+  } catch {
+    // The local state remains a short-term UX cache while the server starts.
+  }
+  saveState();
+  setView(state.activeView);
+  syncActiveTaskUi();
+  render();
+  await fetchState();
+  await refreshDrafts();
+}
+
+bootstrap();

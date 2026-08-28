@@ -896,6 +896,9 @@ def test_session_state_survives_engine_restart(tmp_path):
     session.conversation_history = [{"role": "user", "content": "检索动态推荐系统"}]
     engine.upload_pdf(_text_pdf_bytes("Persistent PDF text."), filename="paper.pdf", session_id="project-a")
     engine._persist_sessions()
+    # SQLite is the source of truth. The compatibility JSON mirror must not
+    # be required to restore a project after the service restarts.
+    session_path.unlink()
 
     restored = ResearchAssistantEngine(
         store_path=store_path,
@@ -911,6 +914,28 @@ def test_session_state_survives_engine_restart(tmp_path):
     assert restored_session.generated_files[0]["name"] == "draft.md"
     assert restored_session.uploaded_documents[0].name == "paper.pdf"
     assert restored_session.uploaded_documents[0].chunks[0].text
+    assert restored.snapshot(session_id="project-a")["messages"] == [{"role": "user", "content": "检索动态推荐系统"}]
+
+
+def test_generated_document_is_saved_as_an_editable_versioned_draft(tmp_path):
+    engine = ResearchAssistantEngine(store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs")
+    paper = Paper(
+        title="Evidence Grounded Recommendation", authors=["Ada Lovelace"],
+        abstract="This paper studies evidence-grounded recommendation.", year=2026, source="dblp",
+        source_url="https://example.org/evidence",
+    )
+    engine.state.papers = [paper]
+    engine.state.evidence_paper_ids = [paper.id]
+    document = engine._generate_document("基于当前证据写一段引言", writing_kind="introduction")
+
+    assert document["draft_id"]
+    draft = engine.get_draft(document["draft_id"])
+    assert draft is not None
+    assert draft["writing_kind"] == "introduction"
+    assert draft["content_markdown"]
+    updated = engine.update_draft(document["draft_id"], {"content_markdown": draft["content_markdown"] + "\n\n补充段落"})
+    assert updated["version"] == 2
+    assert len(engine.draft_versions(document["draft_id"])) == 2
 
 
 def test_reset_session_clears_persisted_session_state(tmp_path):

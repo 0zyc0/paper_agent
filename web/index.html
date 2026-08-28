@@ -157,6 +157,14 @@
                   <span id="draftEvidence" class="inline-status">0 篇证据</span>
                 </div>
                 <div id="draftMeta" class="draft-meta muted"></div>
+                <div class="draft-toolbar">
+                  <select id="draftSelect" aria-label="选择草稿"></select>
+                  <select id="draftVersionSelect" aria-label="选择草稿版本"></select>
+                  <button id="saveDraftBtn" class="secondary-button compact-button" type="button">保存版本</button>
+                  <button id="exportMarkdownBtn" class="secondary-button compact-button" type="button">导出 Markdown</button>
+                  <button id="exportBibtexBtn" class="secondary-button compact-button" type="button">导出 BibTeX</button>
+                </div>
+                <textarea id="draftEditor" class="draft-editor" aria-label="草稿编辑器" placeholder="生成或选择草稿后，可以直接在这里编辑 Markdown 正文。"></textarea>
                 <article id="draftPreview" class="draft-preview muted">生成的章节会在这里预览，并保留对应文件与引用状态。</article>
                 <div id="fileList" class="file-list muted">暂无生成文件</div>
               </section>

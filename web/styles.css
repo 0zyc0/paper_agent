@@ -227,6 +227,10 @@ h1, h2, h3, h4, p { margin: 0; }
 .writing-actions .secondary-button { text-align: left; }
 .draft-surface { display: flex; flex-direction: column; }
 .draft-preview { max-width: 880px; flex: 1; margin-top: 24px; font-size: 15px; line-height: 1.8; }
+.draft-toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+.draft-toolbar select { min-width: 150px; flex: 1 1 180px; }
+.draft-editor { display: block; width: 100%; min-height: 340px; max-width: 980px; margin-top: 16px; border: 1px solid #bdcad9; border-radius: 6px; background: #fff; color: var(--ink); font: 14px/1.65 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; padding: 14px; resize: vertical; }
+.draft-editor:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.12); outline: 0; }
 .file-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--line); }
 .file-link { display: inline-flex; align-items: center; min-height: 32px; border: 1px solid #bdcbd9; border-radius: 6px; color: var(--blue); font-size: 12px; padding: 0 9px; }
 .draft-meta { display: grid; gap: 7px; max-width: 980px; margin-top: 14px; }

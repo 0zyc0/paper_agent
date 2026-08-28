@@ -48,7 +48,11 @@
     if (buffer.trim()) onEvent(JSON.parse(buffer));
   }
 
-  const future = (path, options) => request(path, options);
+  const jsonPost = (path, payload) => request(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
 
   window.paperApi = Object.freeze({
     ApiError,
@@ -61,21 +65,23 @@
       }),
     },
     chat: { stream: streamChat },
+    jobs: {
+      create: (payload) => jsonPost("/api/jobs", payload),
+      get: (projectId, jobId) => request(`/api/jobs/${encodeURIComponent(jobId)}?${new URLSearchParams({ project_id: projectId }).toString()}`),
+      events: (projectId, jobId, afterId = 0) => request(`/api/jobs/${encodeURIComponent(jobId)}/events?${new URLSearchParams({ project_id: projectId, after_id: String(afterId) }).toString()}`),
+    },
     documents: {
       upload: (file, sessionId, paperId = "") => request(
         `/api/pdf/upload?${new URLSearchParams({ session_id: sessionId, filename: file.name, paper_id: paperId || "" }).toString()}`,
         { method: "POST", headers: { "Content-Type": "application/pdf" }, body: file },
       ),
     },
-    // These endpoints define the contract for the project-level backend planned next.
     projects: {
-      list: () => future("/api/projects"),
-      create: (payload) => future("/api/projects", { method: "POST", body: JSON.stringify(payload) }),
-      detail: (projectId) => future(`/api/projects/${projectId}`),
+      list: () => request("/api/projects"),
+      create: (payload) => jsonPost("/api/projects", payload),
+      rename: (projectId, payload) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}`, payload),
     },
     library: {
-      papers: (projectId) => future(`/api/projects/${projectId}/papers`),
-      select: (projectId, payload) => future(`/api/projects/${projectId}/papers/select`, { method: "POST", body: JSON.stringify(payload) }),
       updateState: (sessionId, paperId, updates) => request("/api/library/paper/state", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -103,13 +109,14 @@
       }),
     },
     writing: {
-      drafts: (projectId) => future(`/api/projects/${projectId}/drafts`),
-      createDraft: (projectId, payload) => future(`/api/projects/${projectId}/drafts`, { method: "POST", body: JSON.stringify(payload) }),
-      export: (projectId, payload) => future(`/api/projects/${projectId}/exports`, { method: "POST", body: JSON.stringify(payload) }),
+      drafts: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/drafts`),
+      draft: (projectId, draftId) => request(`/api/projects/${encodeURIComponent(projectId)}/drafts/${encodeURIComponent(draftId)}`),
+      update: (projectId, draftId, payload) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/drafts/${encodeURIComponent(draftId)}`, payload),
+      versions: (projectId, draftId) => request(`/api/projects/${encodeURIComponent(projectId)}/drafts/${encodeURIComponent(draftId)}/versions`),
+      export: (projectId, draftId, format) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/drafts/${encodeURIComponent(draftId)}/export`, { format }),
     },
     discovery: {
-      feed: (sessionId, topic) => future(`/api/discovery/feed?${new URLSearchParams({ session_id: sessionId || "default", topic: topic || "" }).toString()}`),
-      subscriptions: () => future("/api/subscriptions"),
+      feed: (sessionId, topic) => request(`/api/discovery/feed?${new URLSearchParams({ session_id: sessionId || "default", topic: topic || "" }).toString()}`),
     },
   });
 })();
