@@ -30,6 +30,14 @@ const elements = {
   yearFilter: $("#yearFilter"),
   libraryTableBody: $("#libraryTableBody"),
   libraryEmpty: $("#libraryEmpty"),
+  reviewSummary: $("#reviewSummary"),
+  reviewQuestion: $("#reviewQuestion"),
+  reviewSearchStrategy: $("#reviewSearchStrategy"),
+  reviewInclusion: $("#reviewInclusion"),
+  reviewExclusion: $("#reviewExclusion"),
+  saveReviewProtocol: $("#saveReviewProtocolBtn"),
+  exportEvidenceTable: $("#exportEvidenceTableBtn"),
+  exportPrisma: $("#exportPrismaBtn"),
   documentList: $("#documentList"),
   readerHeading: $("#readerHeading"),
   readerBody: $("#readerBody"),
@@ -44,8 +52,11 @@ const elements = {
   draftVersionSelect: $("#draftVersionSelect"),
   draftEditor: $("#draftEditor"),
   saveDraft: $("#saveDraftBtn"),
-  exportMarkdown: $("#exportMarkdownBtn"),
-  exportBibtex: $("#exportBibtexBtn"),
+  restoreDraft: $("#restoreDraftBtn"),
+  exportFormat: $("#exportFormatSelect"),
+  exportDraft: $("#exportDraftBtn"),
+  revisionInstruction: $("#revisionInstruction"),
+  reviseSelection: $("#reviseSelectionBtn"),
   topicList: $("#topicList"),
   feedList: $("#feedList"),
   directionList: $("#directionList"),
@@ -76,7 +87,7 @@ function makeSession() {
     messages: [], papers: [], selectedPaperIds: [], files: [], intent: null,
     lastAction: "", lastGeneratedDocument: null, lastAnswer: "", debug: null,
     uploadedDocuments: [], readerDocumentId: "", taskState: "", taskLog: [], processVisible: false,
-    discovery: null, discoveryLoading: false, researchTopics: [], drafts: [], activeDraftId: "", activeDraft: null, draftVersions: [], activeDraftVersion: 0,
+    discovery: null, discoveryLoading: false, researchTopics: [], systematicReview: null, drafts: [], activeDraftId: "", activeDraft: null, draftVersions: [], activeDraftVersion: 0,
   };
 }
 
@@ -89,6 +100,7 @@ function normalizeSession(session) {
   session.discovery = session.discovery && typeof session.discovery === "object" ? session.discovery : null;
   session.discoveryLoading = Boolean(session.discoveryLoading);
   session.researchTopics = Array.isArray(session.researchTopics) ? session.researchTopics : [];
+  session.systematicReview = session.systematicReview && typeof session.systematicReview === "object" ? session.systematicReview : null;
   session.taskLog = Array.isArray(session.taskLog) ? session.taskLog : [];
   session.drafts = Array.isArray(session.drafts) ? session.drafts : [];
   session.draftVersions = Array.isArray(session.draftVersions) ? session.draftVersions : [];
@@ -197,6 +209,7 @@ function setView(view) {
   saveState();
   render();
   if (view === "discover") fetchDiscovery(false);
+  if (view === "library") fetchSystematicReview(false);
 }
 
 function render() {
@@ -382,19 +395,57 @@ function renderLibrary(session) {
   elements.selectedPaperCount.textContent = String(session.selectedPaperIds.length);
   elements.abstractCount.textContent = String(session.papers.filter((paper) => paper.abstract).length);
   elements.libraryEmpty.hidden = papers.length > 0;
+  renderSystematicReview(session);
   elements.libraryTableBody.innerHTML = papers.map((paper) => {
     const included = session.selectedPaperIds.includes(paper.id) ? " checked" : "";
     const source = paper.source || "unknown";
     const evidence = paperEvidenceState(paper);
     const href = safeHref(paper.source_url || paper.pdf_url || "");
+    const screening = (session.systematicReview?.rows || []).find((row) => row.paper_id === paper.id) || {};
     return `<tr>
       <td><input class="paper-toggle" type="checkbox" data-paper-id="${escapeAttr(paper.id || "")}"${included} aria-label="纳入 ${escapeAttr(paper.title)}" /></td>
       <td><div class="paper-title">${href ? `<a href="${href}" target="_blank" rel="noreferrer">${escapeHtml(paper.title)}</a>` : escapeHtml(paper.title)}</div><p>${escapeHtml((paper.authors || []).slice(0, 3).join(", ") || "作者待补全")}</p></td>
       <td><span class="source-tag">${escapeHtml(source)}</span><small>${escapeHtml(paper.venue || "venue 待补全")}</small></td>
       <td>${escapeHtml(String(paper.year || "-"))}</td>
+      <td>${renderScreeningControl(paper, screening)}</td>
       <td>${renderPaperFileAction(paper, evidence, session)}</td>
     </tr>`;
   }).join("");
+}
+
+function renderSystematicReview(session) {
+  const review = session.systematicReview;
+  const protocol = review?.protocol || {};
+  const summary = review?.summary || {};
+  if (document.activeElement !== elements.reviewQuestion) elements.reviewQuestion.value = protocol.research_question || "";
+  if (document.activeElement !== elements.reviewSearchStrategy) elements.reviewSearchStrategy.value = protocol.search_strategy || "";
+  if (document.activeElement !== elements.reviewInclusion) elements.reviewInclusion.value = (protocol.inclusion_criteria || []).join("\n");
+  if (document.activeElement !== elements.reviewExclusion) elements.reviewExclusion.value = (protocol.exclusion_criteria || []).join("\n");
+  if (!review) {
+    elements.reviewSummary.textContent = "载入后可逐篇记录纳入/排除决定。";
+    elements.reviewSummary.classList.add("muted");
+    return;
+  }
+  elements.reviewSummary.classList.remove("muted");
+  elements.reviewSummary.textContent = `识别 ${summary.identified || 0} · 已筛选 ${summary.screened || 0} · 纳入 ${summary.included || 0} · 待处理 ${summary.pending || 0}`;
+}
+
+function renderScreeningControl(paper, screening) {
+  const decision = screening.decision || "pending";
+  const stage = screening.stage || "title_abstract";
+  const reason = screening.reason || "";
+  return `<div class="screening-control">
+    <select class="paper-screen-decision" data-paper-id="${escapeAttr(paper.id || "")}" aria-label="筛选决定">
+      <option value="pending"${decision === "pending" ? " selected" : ""}>待筛选</option>
+      <option value="include"${decision === "include" ? " selected" : ""}>纳入</option>
+      <option value="exclude"${decision === "exclude" ? " selected" : ""}>排除</option>
+    </select>
+    <select class="paper-screen-stage" data-paper-id="${escapeAttr(paper.id || "")}" aria-label="筛选阶段">
+      <option value="title_abstract"${stage === "title_abstract" ? " selected" : ""}>题录/摘要</option>
+      <option value="full_text"${stage === "full_text" ? " selected" : ""}>全文</option>
+    </select>
+    ${reason ? `<small title="${escapeAttr(reason)}">${escapeHtml(reason)}</small>` : ""}
+  </div>`;
 }
 
 function renderPaperFileAction(paper, evidence, session) {
@@ -476,8 +527,11 @@ function renderWriting(session) {
     : `<option value="">版本 -</option>`;
   elements.draftVersionSelect.disabled = !versions.length;
   elements.saveDraft.disabled = !session.activeDraftId;
-  elements.exportMarkdown.disabled = !session.activeDraftId;
-  elements.exportBibtex.disabled = !session.activeDraftId;
+  elements.restoreDraft.disabled = !session.activeDraftId || !versions.length;
+  elements.exportFormat.disabled = !session.activeDraftId;
+  elements.exportDraft.disabled = !session.activeDraftId;
+  elements.revisionInstruction.disabled = !session.activeDraftId;
+  elements.reviseSelection.disabled = !session.activeDraftId;
   if (!draft) {
     elements.draftTitle.textContent = "尚未生成草稿";
     elements.draftMeta.textContent = "生成后将显示文档类型、引用覆盖和证据强度。";
@@ -1095,6 +1149,55 @@ async function exportActiveDraft(format) {
   }
 }
 
+async function reviseSelectedDraftText() {
+  const session = activeSession();
+  if (!session.activeDraftId) return;
+  const start = elements.draftEditor.selectionStart;
+  const end = elements.draftEditor.selectionEnd;
+  const selectedText = elements.draftEditor.value.slice(start, end);
+  const instruction = elements.revisionInstruction.value.trim();
+  if (!selectedText.trim()) {
+    appendMessage("assistant error", "请先在草稿编辑器中选中需要改写的一段内容。", session.id);
+    return;
+  }
+  if (!instruction) {
+    appendMessage("assistant error", "请填写局部改写要求，例如“压缩为更正式的学术表达”。", session.id);
+    return;
+  }
+  elements.reviseSelection.disabled = true;
+  try {
+    const payload = await window.paperApi.writing.revise(session.id, session.activeDraftId, {
+      selected_text: selectedText,
+      instruction,
+    });
+    session.activeDraft = payload.draft;
+    session.activeDraftVersion = payload.draft.version;
+    elements.revisionInstruction.value = "";
+    await refreshDrafts(session.id, session.activeDraftId);
+    setStatus(`已生成局部改写版本 ${payload.draft.version}`);
+  } catch (error) {
+    appendMessage("assistant error", `局部改写失败：${error.message || error}`, session.id);
+  } finally {
+    if (session.id === state.activeSessionId) renderWriting(session);
+  }
+}
+
+async function restoreSelectedDraftVersion() {
+  const session = activeSession();
+  if (!session.activeDraftId) return;
+  const version = Number(elements.draftVersionSelect.value || 0);
+  if (!version) return;
+  try {
+    const payload = await window.paperApi.writing.restore(session.id, session.activeDraftId, version);
+    session.activeDraft = payload.draft;
+    session.activeDraftVersion = payload.draft.version;
+    await refreshDrafts(session.id, session.activeDraftId);
+    setStatus(`已将版本 ${version} 恢复为新版本 ${payload.draft.version}`);
+  } catch (error) {
+    appendMessage("assistant error", `恢复版本失败：${error.message || error}`, session.id);
+  }
+}
+
 async function fetchState(sessionId = state.activeSessionId) {
   try {
     const snapshot = await window.paperApi.session.snapshot(sessionId);
@@ -1167,6 +1270,69 @@ async function fetchDiscovery(force = false) {
       saveState();
       if (target.id === state.activeSessionId) renderDiscover(target);
     }
+  }
+}
+
+async function fetchSystematicReview(force = false) {
+  const session = activeSession();
+  if (session.systematicReview && !force) {
+    renderSystematicReview(session);
+    return;
+  }
+  try {
+    const payload = await window.paperApi.systematicReview.get(session.id);
+    const target = sessionById(session.id);
+    if (!target) return;
+    target.systematicReview = payload;
+    saveState();
+    if (target.id === state.activeSessionId) renderLibrary(target);
+  } catch (error) {
+    if (session.id === state.activeSessionId) setStatus(`系统综述记录加载失败：${error.message || error}`);
+  }
+}
+
+function reviewProtocolPayload() {
+  return {
+    research_question: elements.reviewQuestion.value.trim(),
+    search_strategy: elements.reviewSearchStrategy.value.trim(),
+    inclusion_criteria: elements.reviewInclusion.value.split("\n").map((item) => item.trim()).filter(Boolean),
+    exclusion_criteria: elements.reviewExclusion.value.split("\n").map((item) => item.trim()).filter(Boolean),
+  };
+}
+
+async function saveSystematicReviewProtocol() {
+  const session = activeSession();
+  try {
+    const payload = await window.paperApi.systematicReview.updateProtocol(session.id, reviewProtocolPayload());
+    session.systematicReview = { ...(session.systematicReview || {}), protocol: payload.protocol };
+    saveState();
+    renderSystematicReview(session);
+    setStatus("系统综述协议已保存");
+  } catch (error) {
+    appendMessage("assistant error", `保存系统综述协议失败：${error.message || error}`, session.id);
+  }
+}
+
+async function screenSystematicReviewPaper(paperId) {
+  const session = activeSession();
+  const decision = elements.libraryTableBody.querySelector(`.paper-screen-decision[data-paper-id="${CSS.escape(paperId)}"]`)?.value || "pending";
+  const stage = elements.libraryTableBody.querySelector(`.paper-screen-stage[data-paper-id="${CSS.escape(paperId)}"]`)?.value || "title_abstract";
+  const reason = decision === "exclude" ? window.prompt("填写排除原因（可留空）") || "" : "";
+  try {
+    await window.paperApi.systematicReview.screen(session.id, { paper_id: paperId, decision, stage, reason });
+    await fetchSystematicReview(true);
+  } catch (error) {
+    appendMessage("assistant error", `更新筛选决定失败：${error.message || error}`, session.id);
+  }
+}
+
+async function exportSystematicReview(format) {
+  const session = activeSession();
+  try {
+    const payload = await window.paperApi.systematicReview.export(session.id, format);
+    if (payload.file?.url) window.open(payload.file.url, "_blank", "noopener");
+  } catch (error) {
+    appendMessage("assistant error", `导出系统综述文件失败：${error.message || error}`, session.id);
   }
 }
 
@@ -1382,7 +1548,15 @@ elements.input.addEventListener("keydown", (event) => {
 });
 elements.sourceFilter.addEventListener("change", () => renderLibrary(activeSession()));
 elements.yearFilter.addEventListener("change", () => renderLibrary(activeSession()));
+elements.saveReviewProtocol.addEventListener("click", saveSystematicReviewProtocol);
+elements.exportEvidenceTable.addEventListener("click", () => exportSystematicReview("evidence_csv"));
+elements.exportPrisma.addEventListener("click", () => exportSystematicReview("prisma_markdown"));
 elements.libraryTableBody.addEventListener("change", (event) => {
+  const screening = event.target.closest(".paper-screen-decision, .paper-screen-stage");
+  if (screening) {
+    screenSystematicReviewPaper(screening.dataset.paperId || "");
+    return;
+  }
   const input = event.target.closest(".paper-toggle");
   if (!input) return;
   const session = activeSession();
@@ -1428,8 +1602,9 @@ elements.draftVersionSelect.addEventListener("change", () => {
   if (session.activeDraftId) loadDraft(session.id, session.activeDraftId, Number(elements.draftVersionSelect.value || 0));
 });
 elements.saveDraft.addEventListener("click", saveActiveDraft);
-elements.exportMarkdown.addEventListener("click", () => exportActiveDraft("markdown"));
-elements.exportBibtex.addEventListener("click", () => exportActiveDraft("bibtex"));
+elements.restoreDraft.addEventListener("click", restoreSelectedDraftVersion);
+elements.exportDraft.addEventListener("click", () => exportActiveDraft(elements.exportFormat.value));
+elements.reviseSelection.addEventListener("click", reviseSelectedDraftText);
 elements.fileList.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-preview-file]");
   if (!button) return;

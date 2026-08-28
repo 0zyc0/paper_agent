@@ -114,6 +114,14 @@
       update: (projectId, draftId, payload) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/drafts/${encodeURIComponent(draftId)}`, payload),
       versions: (projectId, draftId) => request(`/api/projects/${encodeURIComponent(projectId)}/drafts/${encodeURIComponent(draftId)}/versions`),
       export: (projectId, draftId, format) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/drafts/${encodeURIComponent(draftId)}/export`, { format }),
+      revise: (projectId, draftId, payload) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/drafts/${encodeURIComponent(draftId)}/revise`, payload),
+      restore: (projectId, draftId, version) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/drafts/${encodeURIComponent(draftId)}/restore`, { version }),
+    },
+    systematicReview: {
+      get: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/systematic-review`),
+      updateProtocol: (projectId, payload) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/systematic-review`, payload),
+      screen: (projectId, payload) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/systematic-review/screen`, payload),
+      export: (projectId, format) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/systematic-review/export`, { format }),
     },
     discovery: {
       feed: (sessionId, topic) => request(`/api/discovery/feed?${new URLSearchParams({ session_id: sessionId || "default", topic: topic || "" }).toString()}`),

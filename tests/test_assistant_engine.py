@@ -938,6 +938,51 @@ def test_generated_document_is_saved_as_an_editable_versioned_draft(tmp_path):
     assert len(engine.draft_versions(document["draft_id"])) == 2
 
 
+def test_draft_export_revision_and_restore_keep_an_auditable_history(tmp_path):
+    engine = ResearchAssistantEngine(store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs")
+    paper = Paper(
+        title="Evidence Grounded Recommendation", authors=["Ada Lovelace"], year=2026,
+        source="dblp", source_url="https://example.org/evidence",
+    )
+    engine.store.save_papers([paper])
+    draft = engine.store.create_draft(
+        "default",
+        {
+            "title": "Evidence Report",
+            "writing_kind": "research_report",
+            "content_markdown": "# Introduction\n\nOriginal evidence claim \\cite{lovelace2026evidence}.",
+            "bibtex": "@article{lovelace2026evidence, title={Evidence Grounded Recommendation}, year={2026}}",
+            "paper_ids": [paper.id],
+        },
+    )
+
+    class RevisionLLM:
+        available = True
+
+        @staticmethod
+        def chat_text(**kwargs):
+            assert "Original evidence claim" in kwargs["user"]
+            return "Revised evidence claim \\cite{lovelace2026evidence}."
+
+    engine.llm = RevisionLLM()
+    revised = engine.revise_draft(
+        draft["id"],
+        selected_text="Original evidence claim \\cite{lovelace2026evidence}.",
+        instruction="改为更正式的学术表达",
+    )
+
+    assert revised["ok"] is True
+    assert revised["draft"]["version"] == 2
+    assert "Revised evidence claim" in revised["draft"]["content_markdown"]
+    restored = engine.restore_draft_version(draft["id"], version=1)
+    assert restored["ok"] is True
+    assert restored["draft"]["version"] == 3
+    assert "Original evidence claim" in restored["draft"]["content_markdown"]
+    exported = engine.export_draft(draft["id"], format="docx")
+    assert exported["ok"] is True
+    assert (tmp_path / "outputs" / exported["file"]["name"]).exists()
+
+
 def test_reset_session_clears_persisted_session_state(tmp_path):
     store_path = tmp_path / "papers.sqlite"
     session_path = tmp_path / "sessions.json"

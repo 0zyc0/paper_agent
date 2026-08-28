@@ -243,6 +243,9 @@ class ResearchAssistantHandler(BaseHTTPRequestHandler):
         if len(parts) < 4:
             return False
         project_id = parts[2]
+        if len(parts) == 4 and parts[3] == "systematic-review":
+            self._send_json(self.engine.systematic_review(session_id=project_id))
+            return True
         if len(parts) == 4 and parts[3] == "drafts":
             self._send_json({"drafts": self.engine.list_drafts(session_id=project_id)})
             return True
@@ -267,11 +270,47 @@ class ResearchAssistantHandler(BaseHTTPRequestHandler):
                 project = self.engine.rename_project(project_id, str(payload.get("title") or ""))
                 self._send_json({"project": project} if project else {"error": "未找到项目。"}, status=200 if project else 404)
                 return True
+            if len(parts) >= 4 and parts[3] == "systematic-review":
+                if len(parts) == 4:
+                    result = self.engine.update_systematic_review_protocol(payload, session_id=project_id)
+                elif len(parts) == 5 and parts[4] == "screen":
+                    result = self.engine.screen_review_paper(
+                        str(payload.get("paper_id") or ""),
+                        session_id=project_id,
+                        stage=str(payload.get("stage") or "title_abstract"),
+                        decision=str(payload.get("decision") or "pending"),
+                        reason=str(payload.get("reason") or ""),
+                    )
+                elif len(parts) == 5 and parts[4] == "export":
+                    result = self.engine.export_systematic_review(
+                        session_id=project_id, format=str(payload.get("format") or "evidence_csv")
+                    )
+                else:
+                    return False
+                self._send_json(result, status=200 if result.get("ok") else 400)
+                return True
             if len(parts) >= 5 and parts[3] == "drafts":
                 draft_id = parts[4]
                 if len(parts) == 6 and parts[5] == "export":
                     result = self.engine.export_draft(draft_id, session_id=project_id, format=str(payload.get("format") or "markdown"))
-                    self._send_json(result, status=200 if result.get("ok") else 404)
+                    self._send_json(result, status=200 if result.get("ok") else 400)
+                    return True
+                if len(parts) == 6 and parts[5] == "revise":
+                    result = self.engine.revise_draft(
+                        draft_id,
+                        session_id=project_id,
+                        selected_text=str(payload.get("selected_text") or ""),
+                        instruction=str(payload.get("instruction") or ""),
+                    )
+                    self._send_json(result, status=200 if result.get("ok") else 400)
+                    return True
+                if len(parts) == 6 and parts[5] == "restore":
+                    result = self.engine.restore_draft_version(
+                        draft_id,
+                        session_id=project_id,
+                        version=int(payload.get("version") or 0),
+                    )
+                    self._send_json(result, status=200 if result.get("ok") else 400)
                     return True
                 draft = self.engine.update_draft(draft_id, payload, session_id=project_id, note=str(payload.get("note") or "手动编辑"))
                 self._send_json({"draft": draft} if draft else {"error": "未找到草稿。"}, status=200 if draft else 404)

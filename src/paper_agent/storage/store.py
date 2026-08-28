@@ -22,6 +22,21 @@ def _json_object(value: object) -> dict:
     return _json_value(value, {})
 
 
+def _clean_string_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        values = value.splitlines()
+    elif isinstance(value, list):
+        values = value
+    else:
+        values = []
+    cleaned: list[str] = []
+    for item in values:
+        text = str(item or "").strip()
+        if text and text not in cleaned:
+            cleaned.append(text)
+    return cleaned
+
+
 class SQLitePaperStore:
     def __init__(self, path: str | Path = "data/papers.sqlite") -> None:
         self.path = Path(path)
@@ -411,6 +426,8 @@ class SQLitePaperStore:
             conn.execute("DELETE FROM project_documents WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM drafts WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM jobs WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM review_protocols WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM review_screenings WHERE project_id = ?", (project_id,))
             conn.execute("UPDATE projects SET state_json = ?, updated_at = ? WHERE id = ?", (json.dumps(state or {}, ensure_ascii=False), now, project_id))
 
     def replace_project_papers(self, project_id: str, paper_ids: list[str], *, selected_ids: list[str] | None = None) -> None:
@@ -543,6 +560,82 @@ class SQLitePaperStore:
             rows = conn.execute(
                 "SELECT version, content_markdown, bibtex, note, created_at FROM draft_versions WHERE draft_id = ? ORDER BY version DESC",
                 (draft_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ---- Systematic review workspace -----------------------------------------
+
+    def get_review_protocol(self, project_id: str) -> dict:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM review_protocols WHERE project_id = ?", (project_id,)).fetchone()
+        if not row:
+            return {
+                "project_id": project_id,
+                "research_question": "",
+                "inclusion_criteria": [],
+                "exclusion_criteria": [],
+                "search_strategy": "",
+                "updated_at": "",
+            }
+        return {
+            "project_id": row["project_id"],
+            "research_question": row["research_question"],
+            "inclusion_criteria": _json_value(row["inclusion_json"], []),
+            "exclusion_criteria": _json_value(row["exclusion_json"], []),
+            "search_strategy": row["search_strategy"],
+            "updated_at": row["updated_at"],
+        }
+
+    def upsert_review_protocol(self, project_id: str, payload: dict) -> dict:
+        current = self.get_review_protocol(project_id)
+        question = str(payload.get("research_question", current["research_question"]) or "").strip()
+        strategy = str(payload.get("search_strategy", current["search_strategy"]) or "").strip()
+        inclusion = _clean_string_list(payload.get("inclusion_criteria", current["inclusion_criteria"]))
+        exclusion = _clean_string_list(payload.get("exclusion_criteria", current["exclusion_criteria"]))
+        now = utc_now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO review_protocols (project_id, research_question, inclusion_json, exclusion_json, search_strategy, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    research_question = excluded.research_question,
+                    inclusion_json = excluded.inclusion_json,
+                    exclusion_json = excluded.exclusion_json,
+                    search_strategy = excluded.search_strategy,
+                    updated_at = excluded.updated_at
+                """,
+                (project_id, question, json.dumps(inclusion, ensure_ascii=False), json.dumps(exclusion, ensure_ascii=False), strategy, now, now),
+            )
+        return self.get_review_protocol(project_id)
+
+    def set_review_screening(self, project_id: str, paper_id: str, *, stage: str, decision: str, reason: str = "") -> dict:
+        if stage not in {"title_abstract", "full_text"}:
+            raise ValueError("筛选阶段只能是 title_abstract 或 full_text。")
+        if decision not in {"include", "exclude", "pending"}:
+            raise ValueError("筛选决定只能是 include、exclude 或 pending。")
+        canonical_id = self.resolve_paper_id(paper_id) or paper_id
+        now = utc_now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO review_screenings (project_id, paper_id, stage, decision, reason, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, paper_id) DO UPDATE SET
+                    stage = excluded.stage,
+                    decision = excluded.decision,
+                    reason = excluded.reason,
+                    updated_at = excluded.updated_at
+                """,
+                (project_id, canonical_id, stage, decision, str(reason or "").strip(), now),
+            )
+        return {"project_id": project_id, "paper_id": canonical_id, "stage": stage, "decision": decision, "reason": str(reason or "").strip(), "updated_at": now}
+
+    def list_review_screenings(self, project_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT paper_id, stage, decision, reason, updated_at FROM review_screenings WHERE project_id = ? ORDER BY updated_at DESC",
+                (project_id,),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -813,11 +906,38 @@ class SQLitePaperStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS review_protocols (
+                    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                    research_question TEXT NOT NULL DEFAULT '',
+                    inclusion_json TEXT NOT NULL DEFAULT '[]',
+                    exclusion_json TEXT NOT NULL DEFAULT '[]',
+                    search_strategy TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS review_screenings (
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                    stage TEXT NOT NULL DEFAULT 'title_abstract',
+                    decision TEXT NOT NULL DEFAULT 'pending',
+                    reason TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (project_id, paper_id)
+                )
+                """
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_project_messages_project_created ON project_messages(project_id, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_project_papers_project ON project_papers(project_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_drafts_project_updated ON drafts(project_id, updated_at DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_project_updated ON jobs(project_id, updated_at DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_job_events_job_id ON job_events(job_id, id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_review_screenings_project ON review_screenings(project_id)")
             self._ensure_column(conn, "jobs", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_aliases_canonical ON paper_id_aliases(paper_id)")
 

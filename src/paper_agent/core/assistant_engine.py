@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from .agent_runtime import AgentTool, IterativeAgentRuntime, ToolResult
 from .discovery import DiscoveryService
+from .draft_exports import DraftExportError, export_draft as export_draft_artifact
 from .fulltext import PaperFullTextManager
 from .intent import ActionIntent, IntentAnalyzer, ResearchIntent
 from .orchestration import AgentRequestContext, PaperAgentOrchestrator
@@ -24,6 +25,7 @@ from .models import Paper, normalize_text, utc_now_iso
 from .pdf_reader import PdfChunk, PdfExtractionError, extract_pdf_text, relevant_chunks
 from .rank import rank_papers
 from .related_work import RelatedWorkGenerator, writing_plan_for
+from .systematic_review import review_snapshot, write_review_export
 from ..tools.search import PaperSearchService, dedupe_papers
 from ..tools.registry import PaperToolRegistry, ToolContext
 from ..storage.store import SQLitePaperStore
@@ -838,17 +840,164 @@ class ResearchAssistantEngine:
     def draft_versions(self, draft_id: str, *, session_id: str = "default") -> list[dict]:
         return self.store.draft_versions(_clean_session_id(session_id), draft_id)
 
+    def revise_draft(
+        self,
+        draft_id: str,
+        *,
+        selected_text: str,
+        instruction: str,
+        session_id: str = "default",
+    ) -> dict:
+        """Rewrite one selected passage while retaining the rest of the draft verbatim."""
+        draft = self.get_draft(draft_id, session_id=session_id)
+        selected = str(selected_text or "")
+        request = normalize_text(instruction or "")
+        if not draft:
+            return {"ok": False, "error": "未找到草稿。"}
+        if not selected or selected not in str(draft.get("content_markdown") or ""):
+            return {"ok": False, "error": "请先在编辑器中选中需要修改的原文。"}
+        if not request:
+            return {"ok": False, "error": "请填写对选中段落的修改要求。"}
+        if not self.llm.available:
+            return {"ok": False, "error": "局部改写需要配置 Kimi API Key。"}
+        citation_keys = ", ".join(_bibtex_keys(str(draft.get("bibtex") or ""))) or "无"
+        system = (
+            "你是严谨的学术论文编辑。只改写用户提供的选中段落，不输出标题、解释、Markdown 代码块或任何额外文字。"
+            "不得捏造事实、论文、实验数值或引用。可保留原有 \\cite{key}；只能使用允许的引用键。"
+            "输出必须是一段可以直接替换原文的完整中文或英文论文段落。"
+        )
+        user = (
+            f"修改要求：{request}\n\n"
+            f"允许引用键：{citation_keys}\n\n"
+            f"选中原文：\n{selected}"
+        )
+        try:
+            revised = self.llm.chat_text(
+                system=system,
+                user=user,
+                max_tokens=max(600, min(2400, len(selected) * 3)),
+                label="draft_local_revision",
+            ).strip()
+        except Exception as exc:
+            return {"ok": False, "error": f"局部改写失败：{exc}"}
+        if not revised:
+            return {"ok": False, "error": "模型没有返回可用的局部改写内容。"}
+        content = str(draft.get("content_markdown") or "").replace(selected, revised, 1)
+        updated = self.update_draft(
+            draft_id,
+            {"content_markdown": content},
+            session_id=session_id,
+            note=f"局部改写：{request[:80]}",
+        )
+        return {"ok": bool(updated), "draft": updated, "revised_text": revised}
+
+    def restore_draft_version(self, draft_id: str, *, version: int, session_id: str = "default") -> dict:
+        """Restore an historical draft as a new version, preserving full history."""
+        draft = self.get_draft(draft_id, session_id=session_id)
+        if not draft:
+            return {"ok": False, "error": "未找到草稿。"}
+        historical = next(
+            (item for item in self.draft_versions(draft_id, session_id=session_id) if int(item.get("version") or 0) == int(version)),
+            None,
+        )
+        if not historical:
+            return {"ok": False, "error": f"未找到版本 {version}。"}
+        updated = self.update_draft(
+            draft_id,
+            {
+                "content_markdown": historical.get("content_markdown") or "",
+                "bibtex": historical.get("bibtex") or "",
+            },
+            session_id=session_id,
+            note=f"恢复版本 {version}",
+        )
+        # Restoring the already-current version should still be a successful no-op.
+        return {"ok": bool(updated), "draft": updated}
+
+    def systematic_review(self, *, session_id: str = "default") -> dict:
+        project_id = _clean_session_id(session_id)
+        state = self._session_state(project_id)
+        project_paper_ids, _ = self.store.project_paper_ids(project_id)
+        wanted = set(project_paper_ids or [paper.id for paper in state.papers if paper.id])
+        papers = [paper for paper in self.store.load_papers() if paper.id in wanted]
+        if not papers:
+            papers = list(state.papers)
+        snapshot = review_snapshot(
+            papers=papers,
+            protocol=self.store.get_review_protocol(project_id),
+            screenings=self.store.list_review_screenings(project_id),
+        )
+        return {"ok": True, **snapshot}
+
+    def update_systematic_review_protocol(self, payload: dict, *, session_id: str = "default") -> dict:
+        project_id = _clean_session_id(session_id)
+        self._session_state(project_id)
+        protocol = self.store.upsert_review_protocol(project_id, payload)
+        return {"ok": True, "protocol": protocol}
+
+    def screen_review_paper(
+        self,
+        paper_id: str,
+        *,
+        stage: str,
+        decision: str,
+        reason: str = "",
+        session_id: str = "default",
+    ) -> dict:
+        project_id = _clean_session_id(session_id)
+        state = self._session_state(project_id)
+        known_ids = {paper.id for paper in state.papers if paper.id}
+        known_ids.update(self.store.project_paper_ids(project_id)[0])
+        if paper_id not in known_ids:
+            return {"ok": False, "error": "该论文不在当前项目的文献池中。"}
+        try:
+            screening = self.store.set_review_screening(
+                project_id, paper_id, stage=stage, decision=decision, reason=reason
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "screening": screening}
+
+    def export_systematic_review(self, *, session_id: str = "default", format: str = "evidence_csv") -> dict:
+        snapshot = self.systematic_review(session_id=session_id)
+        normalized = str(format or "evidence_csv").strip().lower().replace("-", "_")
+        suffixes = {"evidence_csv": ".csv", "csv": ".csv", "prisma": ".md", "prisma_markdown": ".md", "markdown": ".md"}
+        if normalized not in suffixes:
+            return {"ok": False, "error": f"不支持的系统综述导出格式：{format}"}
+        name = f"systematic_review_{datetime.now().strftime('%Y%m%d_%H%M%S')}{suffixes[normalized]}"
+        try:
+            artifact = write_review_export(snapshot=snapshot, format=normalized, path=self.output_dir / name)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "file": {"name": artifact["name"], "url": f"/outputs/{artifact['name']}", "kind": artifact["kind"]}}
+
     def export_draft(self, draft_id: str, *, session_id: str = "default", format: str = "markdown") -> dict:
         draft = self.get_draft(draft_id, session_id=session_id)
         if not draft:
             return {"ok": False, "error": "未找到草稿。"}
+        normalized_format = str(format or "markdown").strip().lower().replace("-", "_")
+        formats = {
+            "markdown": (".md", "markdown"),
+            "bibtex": (".bib", "bibtex"),
+            "latex": (".tex", "latex"),
+            "tex": (".tex", "latex"),
+            "docx": (".docx", "docx"),
+            "ris": (".ris", "ris"),
+            "csl": (".json", "csl_json"),
+            "csl_json": (".json", "csl_json"),
+            "csljson": (".json", "csl_json"),
+        }
+        if normalized_format not in formats:
+            return {"ok": False, "error": f"不支持的导出格式：{format}"}
         safe_title = re.sub(r"[^A-Za-z0-9._-]+", "_", draft["title"]).strip("_") or "draft"
-        if format == "bibtex":
-            suffix, content, kind = ".bib", draft.get("bibtex") or "", "bibtex"
-        else:
-            suffix, content, kind = ".md", draft.get("content_markdown") or "", "markdown"
+        suffix, kind = formats[normalized_format]
         path = self.output_dir / f"{safe_title}_v{draft['version']}{suffix}"
-        path.write_text(content, encoding="utf-8")
+        paper_ids = {str(paper_id) for paper_id in draft.get("paper_ids") or []}
+        papers = [paper for paper in self.store.load_papers() if paper.id in paper_ids]
+        try:
+            export_draft_artifact(draft=draft, papers=papers, format=normalized_format, path=path)
+        except DraftExportError as exc:
+            return {"ok": False, "error": str(exc)}
         return {"ok": True, "file": {"name": path.name, "url": f"/outputs/{path.name}", "kind": kind}}
 
     def update_paper_asset_state(self, paper_id: str, updates: dict, *, session_id: str = "default") -> dict:
@@ -2201,6 +2350,20 @@ Examples:
 
     def _evidence_papers(self) -> list[Paper]:
         active_papers = [paper for paper in self.state.papers if not paper.excluded]
+        # A systematic-review inclusion decision is stronger than the general
+        # project selection. Once the user has screened at least one study as
+        # included, manuscript generation must not quietly reintroduce studies
+        # they explicitly excluded or left outside the final evidence set.
+        project_id = next((key for key, state in self.sessions.items() if state is self.state), "default")
+        included_ids = {
+            str(item.get("paper_id"))
+            for item in self.store.list_review_screenings(project_id)
+            if item.get("decision") == "include"
+        }
+        if included_ids:
+            included = [paper for paper in active_papers if paper.id in included_ids]
+            if included:
+                return included
         if not self.state.evidence_paper_ids:
             return active_papers
         wanted = set(self.state.evidence_paper_ids)
@@ -2850,6 +3013,10 @@ def _document_markdown_preview(content: str, *, limit: int = 6_000) -> str:
     if boundary < limit // 2:
         boundary = limit
     return text[:boundary].rstrip() + "\n\n> 预览已截断，请打开完整 Markdown 文件查看剩余内容。"
+
+
+def _bibtex_keys(bibtex: str) -> list[str]:
+    return re.findall(r"@\w+\s*\{\s*([^,\s]+)", bibtex or "", flags=re.I)
 
 
 def _clean_session_id(session_id: str) -> str:

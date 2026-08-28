@@ -119,9 +119,23 @@
                 <select id="yearFilter" title="按年份筛选"><option value="all">全部年份</option></select>
               </div>
             </div>
+            <section class="review-panel" aria-label="系统综述工作流">
+              <div class="review-panel-heading"><div><p class="eyebrow">系统综述</p><h3>筛选协议与证据表</h3></div><div id="reviewSummary" class="review-summary muted">等待载入项目文献</div></div>
+              <div class="review-protocol-fields">
+                <input id="reviewQuestion" type="text" aria-label="研究问题" placeholder="研究问题（Research Question）">
+                <input id="reviewSearchStrategy" type="text" aria-label="检索策略" placeholder="检索策略、数据源和时间范围">
+                <textarea id="reviewInclusion" aria-label="纳入标准" placeholder="纳入标准，每行一条"></textarea>
+                <textarea id="reviewExclusion" aria-label="排除标准" placeholder="排除标准，每行一条"></textarea>
+              </div>
+              <div class="review-actions">
+                <button id="saveReviewProtocolBtn" class="secondary-button compact-button" type="button">保存协议</button>
+                <button id="exportEvidenceTableBtn" class="secondary-button compact-button" type="button">导出证据表 CSV</button>
+                <button id="exportPrismaBtn" class="secondary-button compact-button" type="button">导出 PRISMA 摘要</button>
+              </div>
+            </section>
             <section class="library-table-wrap">
               <table class="library-table">
-                <thead><tr><th>纳入</th><th>论文</th><th>来源</th><th>年份</th><th>状态 / 原文</th></tr></thead>
+                <thead><tr><th>纳入</th><th>论文</th><th>来源</th><th>年份</th><th>筛选</th><th>状态 / 原文</th></tr></thead>
                 <tbody id="libraryTableBody"></tbody>
               </table>
               <div id="libraryEmpty" class="empty-state visual-empty">
@@ -161,10 +175,22 @@
                   <select id="draftSelect" aria-label="选择草稿"></select>
                   <select id="draftVersionSelect" aria-label="选择草稿版本"></select>
                   <button id="saveDraftBtn" class="secondary-button compact-button" type="button">保存版本</button>
-                  <button id="exportMarkdownBtn" class="secondary-button compact-button" type="button">导出 Markdown</button>
-                  <button id="exportBibtexBtn" class="secondary-button compact-button" type="button">导出 BibTeX</button>
+                  <button id="restoreDraftBtn" class="secondary-button compact-button" type="button">恢复此版本</button>
+                  <select id="exportFormatSelect" aria-label="选择导出格式">
+                    <option value="docx">Word (.docx)</option>
+                    <option value="latex">LaTeX (.tex)</option>
+                    <option value="markdown">Markdown (.md)</option>
+                    <option value="bibtex">BibTeX (.bib)</option>
+                    <option value="ris">RIS (.ris)</option>
+                    <option value="csl_json">CSL-JSON (.json)</option>
+                  </select>
+                  <button id="exportDraftBtn" class="secondary-button compact-button" type="button">导出</button>
                 </div>
                 <textarea id="draftEditor" class="draft-editor" aria-label="草稿编辑器" placeholder="生成或选择草稿后，可以直接在这里编辑 Markdown 正文。"></textarea>
+                <div class="draft-revision-bar">
+                  <input id="revisionInstruction" type="text" aria-label="局部改写要求" placeholder="选中编辑器中的段落后，输入局部修改要求">
+                  <button id="reviseSelectionBtn" class="secondary-button compact-button" type="button">改写选中段落</button>
+                </div>
                 <article id="draftPreview" class="draft-preview muted">生成的章节会在这里预览，并保留对应文件与引用状态。</article>
                 <div id="fileList" class="file-list muted">暂无生成文件</div>
               </section>
