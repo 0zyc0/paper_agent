@@ -7,11 +7,11 @@ from urllib.parse import quote_plus
 
 from ..tools.llm import KimiClient
 from .models import normalize_text
-from .routing import compile_route, detect_routing_signals
+from .routing import RoutingContext, compile_route
 
 
-# Routing only selects an existing deterministic plan. If the optional model
-# gateway is unavailable, rules are a better user experience than a long wait.
+# Routing only selects an existing deterministic plan. The language model owns
+# semantic interpretation; an unavailable model safely falls back to chat.
 ROUTING_LLM_TIMEOUT = 12
 
 
@@ -20,6 +20,9 @@ class ResearchIntent:
     original_request: str
     normalized_topic: str
     cs_area: str
+    # English canonical form drives retrieval; the short Chinese label is only
+    # for the workspace and discovery UI.
+    display_topic: str = ""
     keywords: list[str] = field(default_factory=list)
     queries: list[str] = field(default_factory=list)
     source_queries: dict[str, list[str]] = field(default_factory=dict)
@@ -31,7 +34,7 @@ class ResearchIntent:
     to_year: int | None = None
     constraints: list[str] = field(default_factory=lambda: ["arxiv", "ccf_a_b", "sci_q1_q3"])
     confidence: float = 0.0
-    source: str = "heuristic"
+    source: str = "unknown"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -43,7 +46,7 @@ class ActionIntent:
     action: str
     reason: str = ""
     confidence: float = 0.0
-    source: str = "heuristic"
+    source: str = "unknown"
 
 
 @dataclass
@@ -75,32 +78,26 @@ class IntentAnalyzer:
         conversation_context: str = "",
     ) -> RequestAnalysis:
         """Classify request semantics with Kimi, then compile a safe local tool plan."""
-        if self.llm.available:
-            try:
-                analysis = self._analyze_request_with_kimi(
-                    request,
-                    mode=mode,
-                    has_documents=has_documents,
-                    has_papers=has_papers,
-                    has_generated_document=has_generated_document,
-                    conversation_context=conversation_context,
-                )
-                self.last_action_trace = {"requested": "kimi", "used": "kimi", "fallback": False, "error": ""}
-                self.last_research_trace = {"requested": "kimi", "used": "kimi", "fallback": False, "error": ""}
-                return analysis
-            except Exception as exc:
-                self.last_action_trace = {"requested": "kimi", "used": "heuristic", "fallback": True, "error": str(exc)}
-                self.last_research_trace = {"requested": "kimi", "used": "heuristic", "fallback": True, "error": str(exc)}
-
-        return self._compile_request_analysis(
-            request,
-            data={},
-            has_papers=has_papers,
-            has_documents=has_documents,
-            has_generated_document=has_generated_document,
-            source="heuristic",
-            fallback_reason="Kimi 路由不可用，已按当前工作区状态编译工具计划。",
-        )
+        if not self.llm.available:
+            self.last_action_trace = {"requested": "kimi", "used": "unavailable", "fallback": True, "error": "Kimi API key is not configured."}
+            self.last_research_trace = dict(self.last_action_trace)
+            return self._safe_chat_analysis("Kimi 路由不可用，未执行关键词或正则兜底判断。", request)
+        try:
+            analysis = self._analyze_request_with_kimi(
+                request,
+                mode=mode,
+                has_documents=has_documents,
+                has_papers=has_papers,
+                has_generated_document=has_generated_document,
+                conversation_context=conversation_context,
+            )
+            self.last_action_trace = {"requested": "kimi", "used": "kimi", "fallback": False, "error": ""}
+            self.last_research_trace = {"requested": "kimi", "used": "kimi", "fallback": False, "error": ""}
+            return analysis
+        except Exception as exc:
+            self.last_action_trace = {"requested": "kimi", "used": "safe_chat", "fallback": True, "error": str(exc)}
+            self.last_research_trace = dict(self.last_action_trace)
+            return self._safe_chat_analysis("Kimi 路由未返回有效结构化结果，已安全保留自由问答入口。", request)
 
     def analyze(self, request: str) -> ResearchIntent:
         if self.llm.available:
@@ -109,10 +106,10 @@ class IntentAnalyzer:
                 self.last_research_trace = {"requested": "kimi", "used": "kimi", "fallback": False, "error": ""}
                 return intent
             except Exception as exc:
-                self.last_research_trace = {"requested": "kimi", "used": "heuristic", "fallback": True, "error": str(exc)}
-                return self._analyze_with_rules(request)
-        self.last_research_trace = {"requested": "heuristic", "used": "heuristic", "fallback": False, "error": ""}
-        return self._analyze_with_rules(request)
+                self.last_research_trace = {"requested": "kimi", "used": "safe_default", "fallback": True, "error": str(exc)}
+                return self._safe_research_intent(request)
+        self.last_research_trace = {"requested": "kimi", "used": "unavailable", "fallback": True, "error": "Kimi API key is not configured."}
+        return self._safe_research_intent(request)
 
     def research_from_plan(self, request: str, plan: dict, *, source: str = "agent") -> ResearchIntent:
         """Convert a validated Agent tool payload into the existing search intent contract.
@@ -121,52 +118,105 @@ class IntentAnalyzer:
         intentionally performs no additional model call. Missing optional fields
         are filled from the local parser only to keep search executable.
         """
-        fallback = self._analyze_with_rules(request)
         data = dict(plan or {})
-        if not normalize_text(str(data.get("normalized_topic") or data.get("topic") or "")):
-            data["normalized_topic"] = fallback.normalized_topic
-        data["normalized_topic"] = _sanitize_research_topic(
-            str(data.get("normalized_topic") or data.get("topic") or ""),
-            request,
-        )
+        proposed_topic = normalize_text(str(data.get("normalized_topic") or data.get("topic") or ""))
+        # A planner occasionally echoed the entire request into this field.
+        # Repair only that unambiguous malformed shape with Kimi; Python does
+        # not try to infer a topic from the user's wording.
+        if _is_request_echo(proposed_topic, request):
+            repaired = self.repair_echoed_topic(request, proposed_topic)
+            if repaired:
+                data.update(repaired)
+                proposed_topic = normalize_text(str(data.get("normalized_topic") or ""))
+            else:
+                raise ValueError("paper_search 的主题字段回显了完整用户请求，未获得可用的规范研究主题。")
+        if not proposed_topic:
+            raise ValueError("paper_search 缺少规范化研究主题；请重新提供 normalized_topic。")
+        data["normalized_topic"] = proposed_topic
         if not data.get("queries"):
-            topic = normalize_text(str(data.get("normalized_topic") or data.get("topic") or ""))
-            data["queries"] = [topic] if topic else fallback.queries
+            data["queries"] = [proposed_topic]
         if not data.get("keywords"):
-            data["keywords"] = fallback.keywords
+            data["keywords"] = []
         if not data.get("source_queries"):
-            data["source_queries"] = fallback.source_queries
+            data["source_queries"] = {}
         if not data.get("cs_area"):
-            data["cs_area"] = fallback.cs_area
-        for field_name in ("target_venues", "target_venue_ranks", "recent_years", "from_year", "to_year"):
-            if field_name not in data:
-                data[field_name] = getattr(fallback, field_name)
+            data["cs_area"] = "Interdisciplinary CS"
         intent = self._research_intent_from_data(request, data, source=source)
         self.last_research_trace = {"requested": "agent", "used": source, "fallback": False, "error": ""}
         return intent
+
+    def repair_echoed_topic(self, request: str, proposed_topic: str = "") -> dict:
+        """Ask Kimi to repair an unambiguous instruction-as-topic mistake.
+
+        This is deliberately a narrow data-quality repair, not a keyword or
+        regular-expression intent fallback. It also lets old persisted sessions
+        recover their discovery profile without asking users to create a new one.
+        """
+        if not self.llm.available:
+            return {}
+        system = (
+            "You normalize the research subject for a computer-science literature assistant. "
+            "Return only valid JSON. The proposed topic is an invalid echo of a whole user instruction. "
+            "Extract only the academic research object; do not include action verbs, time ranges, venue constraints, "
+            "words such as research/investigate/progress/latest, or output deliverables. "
+            "Keep essential technical modifiers."
+        )
+        user = f"""
+User request: {request}
+Invalid echoed topic: {proposed_topic or request}
+
+Return exactly:
+{{
+  "normalized_topic": "concise English canonical research topic",
+  "display_topic": "concise Chinese research topic for the UI",
+  "keywords": ["4-8 English technical keywords"],
+  "queries": ["2-4 focused English literature queries"],
+  "cs_area": "one CS area"
+}}
+
+Example: "调研一下最近三年去偏推荐系统工作进展" ->
+{{"normalized_topic":"debiasing recommender systems","display_topic":"去偏推荐系统","keywords":["debiasing","recommendation","recommender systems"],"queries":["debiasing recommender systems","debiasing recommendation"],"cs_area":"AI"}}
+"""
+        try:
+            data = self.llm.chat_json(
+                system=system,
+                user=user,
+                temperature=0.1,
+                max_tokens=500,
+                timeout=ROUTING_LLM_TIMEOUT,
+                stream=False,
+                label="topic_repair",
+            )
+        except Exception:
+            return {}
+        normalized_topic = normalize_text(str(data.get("normalized_topic") or ""))
+        if not normalized_topic or _is_request_echo(normalized_topic, request):
+            return {}
+        return {
+            "normalized_topic": normalized_topic,
+            "display_topic": normalize_text(str(data.get("display_topic") or "")),
+            "keywords": _clean_list(data.get("keywords")),
+            "queries": _clean_list(data.get("queries")),
+            "cs_area": normalize_text(str(data.get("cs_area") or "")),
+        }
 
     def analyze_action(self, request: str, *, mode: str = "auto", has_papers: bool = False) -> ActionIntent:
         if mode == "chat":
             self.last_action_trace = {"requested": "mode", "used": "mode", "fallback": False, "error": ""}
             return ActionIntent(request, "chat", "用户选择自由聊天模式。", 1.0, "mode")
         if mode == "research":
-            action = "document" if _looks_like_document_request(request) else "search"
             self.last_action_trace = {"requested": "mode", "used": "mode", "fallback": False, "error": ""}
-            return ActionIntent(request, action, "用户选择论文调研模式。", 1.0, "mode")
-        contextual = _contextual_follow_up_action(request, has_papers=has_papers)
-        if contextual:
-            self.last_action_trace = {"requested": "contextual", "used": "contextual", "fallback": False, "error": ""}
-            return contextual
+            return ActionIntent(request, "search", "用户选择论文调研模式。", 1.0, "mode")
         if self.llm.available:
             try:
                 action = self._analyze_action_with_kimi(request, has_papers=has_papers)
                 self.last_action_trace = {"requested": "kimi", "used": "kimi", "fallback": False, "error": ""}
                 return action
             except Exception as exc:
-                self.last_action_trace = {"requested": "kimi", "used": "heuristic", "fallback": True, "error": str(exc)}
-                return self._analyze_action_with_rules(request, has_papers=has_papers)
-        self.last_action_trace = {"requested": "heuristic", "used": "heuristic", "fallback": False, "error": ""}
-        return self._analyze_action_with_rules(request, has_papers=has_papers)
+                self.last_action_trace = {"requested": "kimi", "used": "safe_chat", "fallback": True, "error": str(exc)}
+                return ActionIntent(request, "chat", "Kimi 路由失败，安全保留自由问答。", 0.0, "safe_chat")
+        self.last_action_trace = {"requested": "kimi", "used": "unavailable", "fallback": True, "error": "Kimi API key is not configured."}
+        return ActionIntent(request, "chat", "Kimi 路由不可用，安全保留自由问答。", 0.0, "safe_chat")
 
     def _analyze_action_with_kimi(self, request: str, *, has_papers: bool) -> ActionIntent:
         system = (
@@ -213,7 +263,7 @@ Routing examples:
         )
         action = normalize_text(str(data.get("action") or "")).lower()
         if action not in {"chat", "search", "answer", "document"}:
-            action = self._analyze_action_with_rules(request, has_papers=has_papers).action
+            action = "chat"
         return ActionIntent(
             original_request=request,
             action=action,
@@ -256,12 +306,15 @@ Conversation and workspace context (may be empty):
 Return JSON with exactly these keys:
 - category: one of "chat", "literature_search", "evidence_qa", "paper_reading", "document_writing", "document_inspection", "discovery"
 - subtask: concise subtask such as "fresh_search", "current_evidence_survey", "related_work", "bibtex", "uploaded_pdf_summary", "generated_file_check"
-- deliverable: one of "none", "survey", "related_work", "introduction", "method_section", "experiment_section", "summary", "bibtex", "markdown", "report", "answer"
-- needs_fresh_literature: true only when the user explicitly asks for new, refreshed, expanded, or latest external literature; otherwise false.
+- deliverable: one of "none", "survey", "related_work", "introduction", "method_section", "experiment_section", "summary", "bibtex", "markdown", "report", "answer", "outline"
+- evidence_scope: one of "none", "current_evidence", "uploaded_pdf", "mixed", "fresh_search", "generated_document"
+- tool_plan: a non-empty ordered list using only "free_chat", "paper_search", "pdf_read", "paper_fulltext_read", "evidence_answer", "write_document", "document_inspect"
+- needs_fresh_literature: true only when the tool_plan contains paper_search; otherwise false.
 - topic_relation: one of "current_workspace", "new_topic", "follow_up", or "unknown".
 - reason: short Chinese reason
 - confidence: 0 to 1
 - normalized_topic: concise English topic
+- display_topic: concise Chinese UI label for the same research topic
 - cs_area: NLP, AI, ML, CV, DB, SE, Security, Systems, Networks, HCI, Graphics, Theory, Robotics, or Interdisciplinary CS
 - keywords: 4-8 English keywords
 - queries: 2-4 precise English queries
@@ -279,6 +332,16 @@ Rules:
   - document_writing: user asks to write/export/generate a survey, related work, section, chapter, report, BibTeX, markdown, or summary.
   - document_inspection: user asks where the generated file is, whether it is empty, or what it contains.
   - discovery: user asks for latest trends/news/research progress recommendations.
+- Tool-plan contract:
+  - Ordinary greeting, brainstorming, coding-independent help, or open conversation -> category chat, evidence_scope none, tool_plan ["free_chat"]. This is the permanent free-chat entry; do not turn "hello" into evidence QA or search merely because papers exist.
+  - Fresh literature retrieval -> literature_search, fresh_search, ["paper_search"].
+  - Fresh retrieval followed by a requested document -> document_writing, fresh_search, ["paper_search", "write_document"].
+  - Question answerable from current papers -> evidence_qa, current_evidence, ["evidence_answer"].
+  - Uploaded PDF explanation -> paper_reading, uploaded_pdf, ["pdf_read"].
+  - Uploaded PDF plus a requested document -> document_writing, uploaded_pdf, ["pdf_read", "write_document"].
+  - Current evidence writing -> document_writing, current_evidence, ["write_document"].
+  - Inspecting the last generated output -> document_inspection, generated_document, ["document_inspect"].
+  - A detailed question about a cached paper's method or experiment may use ["paper_fulltext_read"] when no uploaded PDF is the target.
 - Stage 2: decide whether new retrieval is needed. If the request says “按现在已调研的文献”, “基于已有论文”, “基于这些论文”, “根据当前证据”, or similar, set needs_fresh_literature to false.
 - Treat “目前文献库/现有文献库/我的文献库/已选论文/当前论文池” as current workspace references. For example, “我想基于目前文献库写一篇调研” is document_writing using current_workspace, not a new literature search. The word “调研” may describe a report or survey deliverable; it is not by itself proof that external search is needed.
 - If an existing paper pool is about one topic but the user clearly names a different new academic topic, set topic_relation to new_topic and needs_fresh_literature to true. If the request only says “写一篇调研/综述” without naming a new topic, use current_workspace.
@@ -289,6 +352,7 @@ Rules:
 - If the user asks an ordinary follow-up about current papers, choose evidence_qa; do not set needs_fresh_literature unless the user explicitly asks for new, different, refreshed, or broader literature.
 - If current retrieved papers exist and the user asks to write a survey/综述/章节/related work from current or already-investigated literature, choose document_writing and set needs_fresh_literature to false.
 - "近两年 ICLR 上动态推荐系统论文并生成 bib" means category document_writing, normalized_topic "dynamic recommender systems", target_venues ["ICLR"], recent_years 2. Never put bib in a query.
+- "调研一下最近三年去偏推荐系统工作进展" means normalized_topic "debiasing recommender systems" and display_topic "去偏推荐系统". The full Chinese instruction must never be a topic.
 - "按现在已调研的文献，写一篇survey综述方法介绍章节" means category document_writing, subtask current_evidence_survey, deliverable survey, needs_fresh_literature false, normalized_topic should reuse context or be empty. Never search for "survey".
 - "A会和B会的目标检测" means target_venue_ranks ["CCF-A", "CCF-B"], not literal venue names.
 - For dynamic recommendation include a short query such as "dynamic rec" as one variant, but do not drop the word dynamic.
@@ -325,20 +389,18 @@ Rules:
         fallback_reason: str = "",
     ) -> RequestAnalysis:
         """Turn semantic intent into one executable plan owned by the application."""
-        signals = detect_routing_signals(
-            request,
-            has_papers=has_papers,
-            has_documents=has_documents,
-            has_generated_document=has_generated_document,
-        )
         decision = compile_route(
-            request,
-            signals=signals,
+            context=RoutingContext(
+                has_papers=has_papers,
+                has_documents=has_documents,
+                has_generated_document=has_generated_document,
+            ),
             llm_category=str(data.get("category") or ""),
             llm_subtask=str(data.get("subtask") or ""),
             llm_deliverable=str(data.get("deliverable") or ""),
+            llm_evidence_scope=str(data.get("evidence_scope") or ""),
+            llm_tool_plan=data.get("tool_plan") if isinstance(data.get("tool_plan"), list) else data.get("tools"),
             llm_reason=str(data.get("reason") or fallback_reason),
-            llm_requests_fresh_search=_safe_bool(data.get("needs_fresh_literature")),
         )
         action_name = {
             "document_writing": "document",
@@ -368,6 +430,20 @@ Rules:
             search_required=decision.search_required,
         )
 
+    @staticmethod
+    def _safe_chat_analysis(reason: str, request: str = "") -> RequestAnalysis:
+        action = ActionIntent(request, "chat", reason, 0.0, "safe_chat")
+        return RequestAnalysis(
+            action=action,
+            research=None,
+            tools=["free_chat"],
+            category="chat",
+            subtask="general_chat",
+            deliverable="none",
+            evidence_scope="none",
+            search_required=False,
+        )
+
     def _analyze_with_kimi(self, request: str) -> ResearchIntent:
         system = (
             "You are a computer-science research intent analyzer. "
@@ -387,6 +463,7 @@ User request:
 
 Return JSON with these keys:
 - normalized_topic: concise English research topic
+- display_topic: concise Chinese UI label for the same research topic
 - cs_area: one of NLP, AI, ML, CV, DB, SE, Security, Systems, Networks, HCI, Graphics, Theory, Robotics, Interdisciplinary CS
 - keywords: 6-12 English keywords
 - queries: 4-8 precise English paper-search queries
@@ -428,35 +505,23 @@ The agent will search DBLP, arXiv, and Google Scholar. Return JSON only.
         return self._research_intent_from_data(request, data, source="kimi")
 
     def _research_intent_from_data(self, request: str, data: dict, *, source: str) -> ResearchIntent:
-        queries = _clean_list(data.get("queries")) or [normalize_text(request)]
-        queries = _sanitize_queries(queries, request)
+        normalized_topic = normalize_text(str(data.get("normalized_topic") or data.get("topic") or ""))
+        queries = _clean_list(data.get("queries")) or ([normalized_topic] if normalized_topic else [])
+        if not normalized_topic and queries:
+            normalized_topic = queries[0]
+        if not normalized_topic:
+            # Never persist a complete user instruction as a research topic.
+            normalized_topic = "computer science"
         keywords = _clean_list(data.get("keywords"))
-        keywords = _sanitize_keywords(keywords, request)
-        source_queries = _sanitize_source_queries(_clean_source_queries(data.get("source_queries"), queries), request)
+        source_queries = _clean_source_queries(data.get("source_queries"), queries or [normalized_topic])
         recent_years = _safe_int(data.get("recent_years"))
         from_year = _safe_int(data.get("from_year"))
         to_year = _safe_int(data.get("to_year"))
-        normalized_topic = _sanitize_research_topic(str(data.get("normalized_topic") or queries[0]), request)
-        if not normalized_topic:
-            normalized_topic = _sanitize_research_topic(queries[0], request) or "computer science"
-        # 用户明确给出的研究方向和时间范围比模型返回的泛化整句更可靠。
-        rule_intent = self._analyze_with_rules(request)
-        prefer_rules = _prefer_rule_intent(request, normalized_topic)
-        if prefer_rules:
-            normalized_topic = rule_intent.normalized_topic
-            queries = rule_intent.queries
-            keywords = rule_intent.keywords
-            source_queries = rule_intent.source_queries
-        explicit_recent_years = _extract_recent_years(request)
-        explicit_from_year, explicit_to_year = _extract_year_range(request)
-        if explicit_recent_years is not None:
-            recent_years = explicit_recent_years
-        if explicit_from_year is not None or explicit_to_year is not None:
-            from_year, to_year = explicit_from_year, explicit_to_year
         return ResearchIntent(
             original_request=request,
             normalized_topic=normalized_topic,
-            cs_area=rule_intent.cs_area if prefer_rules else normalize_text(str(data.get("cs_area") or "Interdisciplinary CS")),
+            display_topic=normalize_text(str(data.get("display_topic") or "")),
+            cs_area=normalize_text(str(data.get("cs_area") or "Interdisciplinary CS")),
             keywords=keywords,
             queries=queries,
             source_queries=source_queries,
@@ -470,70 +535,35 @@ The agent will search DBLP, arXiv, and Google Scholar. Return JSON only.
             source=source,
         )
 
-    def _analyze_action_with_rules(self, request: str, *, has_papers: bool) -> ActionIntent:
-        lowered = request.lower()
-        contextual = _contextual_follow_up_action(request, has_papers=has_papers)
-        if contextual:
-            return contextual
-        if _looks_like_document_request(request):
-            return ActionIntent(request, "document", "检测到生成或导出文档需求。", 0.55)
-        search_words = [
-            "检索",
-            "搜索",
-            "查",
-            "调研",
-            "论文",
-            "paper",
-            "arxiv",
-            "dblp",
-            "scholar",
-            "谷歌学术",
-            "会议",
-            "期刊",
-            "系统",
-            "推荐",
-            "检测",
-            "分割",
-            "识别",
-        ]
-        if any(word in lowered for word in search_words) and _has_explicit_search_intent(request):
-            return ActionIntent(request, "search", "检测到论文检索相关表达。", 0.45)
-        if has_papers:
-            return ActionIntent(request, "answer", "已有论文池，按当前结果回答。", 0.4)
-        return ActionIntent(request, "chat", "未检测到明确检索需求。", 0.35)
-
-    def _analyze_with_rules(self, request: str) -> ResearchIntent:
-        normalized = _translate_common_terms(request)
-        target_venues = _extract_target_venues(request)
-        target_venue_ranks = _extract_target_venue_ranks(request)
-        recent_years = _extract_recent_years(request)
-        from_year, to_year = _extract_year_range(request)
-        tokens = _keyword_tokens(normalized)
-        target_tokens = {venue.lower().replace("-", "") for venue in target_venues}
-        tokens = [token for token in tokens if token.replace("-", "") not in target_tokens]
-        cs_area = _guess_area(normalized)
-        topic = " ".join(tokens[:10]) if tokens else normalize_text(normalized)
-        topic = _sanitize_research_topic(topic, request)
-        if not topic:
-            topic = _sanitize_research_topic(normalize_text(request), request)
-        queries = _build_queries(topic, tokens)
-        source_queries = _build_source_queries(queries, tokens)
+    @staticmethod
+    def _safe_research_intent(request: str) -> ResearchIntent:
+        topic = "computer science"
+        source_queries = _clean_source_queries({}, [topic])
         return ResearchIntent(
             original_request=request,
             normalized_topic=topic,
-            cs_area=cs_area,
-            keywords=tokens[:12],
-            queries=queries,
+            display_topic="",
+            cs_area="Interdisciplinary CS",
+            queries=[topic],
             source_queries=source_queries,
-            source_urls=_source_urls(source_queries, recent_years=recent_years, from_year=from_year, to_year=to_year),
-            target_venues=target_venues,
-            target_venue_ranks=target_venue_ranks,
-            recent_years=recent_years,
-            from_year=from_year,
-            to_year=to_year,
-            confidence=0.45,
-            source="heuristic",
+            source_urls=_source_urls(source_queries, recent_years=None, from_year=None, to_year=None),
+            confidence=0.0,
+            source="safe_default",
         )
+
+    def _analyze_action_with_rules(self, request: str, *, has_papers: bool) -> ActionIntent:
+        return ActionIntent(request, "chat", "启发式动作路由已停用；请使用 Kimi 结构化路由。", 0.0, "safe_chat")
+
+    def _analyze_with_rules(self, request: str) -> ResearchIntent:
+        """Compatibility shim; heuristic intent extraction is intentionally disabled."""
+        return self._safe_research_intent(request)
+
+
+def _is_request_echo(topic: str, request: str) -> bool:
+    """Detect only the exact malformed planner shape, without interpreting text."""
+    normalized_topic = normalize_text(topic).casefold()
+    normalized_request = normalize_text(request).casefold()
+    return bool(normalized_topic and normalized_request and normalized_topic == normalized_request)
 
 
 def _clean_list(value) -> list[str]:

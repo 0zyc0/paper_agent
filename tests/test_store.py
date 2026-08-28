@@ -153,9 +153,9 @@ def test_sqlite_store_merges_same_title_across_sources(tmp_path):
     store = SQLitePaperStore(tmp_path / "papers.sqlite")
     dblp_paper = Paper(
         title="Enhancing New-item Fairness in Dynamic Recommender Systems.",
-        authors=["A"],
+        authors=["A…"],
         year=2025,
-        venue="SIGIR",
+        venue="Proceedings of SIGIR …",
         source="dblp",
         source_url="https://dblp.org/rec/conf/sigir/example",
     )
@@ -164,6 +164,7 @@ def test_sqlite_store_merges_same_title_across_sources(tmp_path):
         authors=["A", "B"],
         abstract="This work studies new-item fairness in dynamic recommender systems.",
         year=2025,
+        venue="SIGIR",
         source="google_scholar",
         source_url="https://example.org/scholar",
     )
@@ -174,6 +175,8 @@ def test_sqlite_store_merges_same_title_across_sources(tmp_path):
 
     assert len(papers) == 1
     assert papers[0].abstract == scholar_paper.abstract
+    assert papers[0].authors == ["A", "B"]
+    assert papers[0].venue == "SIGIR"
     assert set(papers[0].source.split(",")) == {"dblp", "google_scholar"}
 
 
@@ -254,3 +257,4 @@ def test_sqlite_store_dedupes_existing_rows_and_repoints_queries(tmp_path):
     with store._connect() as conn:
         query_paper_ids = {row[0] for row in conn.execute("SELECT paper_id FROM paper_queries").fetchall()}
     assert query_paper_ids == {papers[0].id}
+    assert store.resolve_paper_id("manual_duplicate_id") == papers[0].id

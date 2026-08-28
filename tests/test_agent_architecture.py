@@ -3,12 +3,26 @@ from paper_agent.core.orchestration import AgentRequestContext, PaperAgentOrches
 from paper_agent.tools.registry import PaperToolRegistry, ToolContext
 
 
-def test_orchestrator_binds_current_evidence_writing_to_academic_skill():
+class _WritingRouteLlm:
+    available = True
+
+    def chat_json(self, **_kwargs):
+        return {
+            "category": "document_writing",
+            "subtask": "current_evidence_writing",
+            "deliverable": "introduction",
+            "evidence_scope": "current_evidence",
+            "tool_plan": ["write_document"],
+            "reason": "基于当前证据生成引言。",
+        }
+
+
+def test_orchestrator_routes_writing_deliverable_inside_the_unified_skill():
     registry = PaperToolRegistry()
     orchestrator = PaperAgentOrchestrator(tool_registry=registry)
 
     task = orchestrator.prepare(
-        IntentAnalyzer(),
+        IntentAnalyzer(llm=_WritingRouteLlm()),
         AgentRequestContext(
             message="基于当前证据池生成 introduction",
             mode="auto",
@@ -20,6 +34,10 @@ def test_orchestrator_binds_current_evidence_writing_to_academic_skill():
 
     assert task.tools == ["write_document"]
     assert [skill.name for skill in task.skills] == ["academic-writing"]
+    assert task.skills[0].variant == "introduction"
+    assert "# 引言" in task.skills[0].prompt()
+    assert task.skills[0].payload()["instruction_file"] == "academic-writing/resources/introduction.md"
+    assert "# 写作场景路由" in task.skills[0].prompt()
     assert task.analysis.search_required is False
 
 

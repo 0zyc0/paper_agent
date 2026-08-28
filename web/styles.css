@@ -1146,3 +1146,116 @@ body {
     height: 150px;
   }
 }
+
+/* Brand asset and final visual hierarchy */
+.brand-mark {
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.brand-mark img {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.brand-block {
+  position: relative;
+  isolation: isolate;
+}
+
+.brand-block::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  right: 14px;
+  bottom: 12px;
+  width: 64px;
+  height: 64px;
+  border: 1px solid rgba(36, 86, 198, 0.12);
+  border-radius: 18px;
+  background: rgba(36, 86, 198, 0.045);
+  transform: rotate(12deg);
+}
+
+.workspace-header {
+  position: relative;
+  overflow: hidden;
+}
+
+.workspace-header::before {
+  content: "";
+  position: absolute;
+  right: 286px;
+  top: -118px;
+  width: 280px;
+  height: 280px;
+  border: 1px solid rgba(15, 118, 110, 0.1);
+  border-radius: 50%;
+  pointer-events: none;
+}
+
+.workspace-title-block,
+.header-actions {
+  position: relative;
+  z-index: 1;
+}
+
+.header-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.header-actions .secondary-button {
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.surface-heading .eyebrow,
+.discover-section .eyebrow,
+.writing-sidebar .eyebrow {
+  color: #72819a;
+}
+
+.empty-chat p {
+  position: relative;
+  padding-top: 50px;
+  color: #66758b;
+  font-weight: 650;
+}
+
+.empty-chat p::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 0;
+  width: 36px;
+  height: 36px;
+  transform: translateX(-50%);
+  border-radius: 12px;
+  background: url("/assets/research-studio-logo.svg") center / contain no-repeat;
+}
+
+.draft-surface::before,
+.reader-content::before {
+  content: "";
+  display: block;
+  width: 52px;
+  height: 4px;
+  margin-bottom: 20px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--teal), var(--blue));
+}
+
+@media (max-width: 780px) {
+  .workspace-header::before { display: none; }
+  .header-actions { width: auto; }
+  .header-actions .secondary-button { display: none; }
+  .header-actions .secondary-button:last-of-type { display: inline-flex; }
+  .workspace-visual { display: none; }
+  .conversation-surface { min-height: auto; }
+  .empty-chat { min-height: 96px; }
+  .messages { min-height: 0; max-height: none; padding: 16px; }
+}

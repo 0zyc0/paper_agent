@@ -4,7 +4,7 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterator
 
 from .http_client import post_json, post_sse_json
 
@@ -110,6 +110,59 @@ class KimiClient:
         result = response["choices"][0]["message"]["content"]
         self._finish_call(entry, response_text=result)
         return result
+
+    def stream_text(
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: float = 0.2,
+        max_tokens: int = 2500,
+        timeout: int = 300,
+        label: str = "",
+    ) -> Iterator[str]:
+        """Yield completion text deltas as they arrive from Kimi.
+
+        ``chat_text(stream=True)`` is intentionally kept as the convenient
+        collect-then-return API used by existing tools.  The web Agent needs a
+        real iterator so it can forward each delta to the browser immediately.
+        """
+        if not self.api_key:
+            raise RuntimeError("Kimi API key is not configured. Set KIMI_API_KEY or MOONSHOT_API_KEY.")
+        entry = self._start_call(label=label or "stream_text", stream=True, max_tokens=max_tokens)
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": self.temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        chunks: list[str] = []
+        try:
+            for event in post_sse_json(
+                f"{self.api_base}/chat/completions",
+                payload,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=timeout,
+            ):
+                usage = event.get("usage")
+                if usage is not None:
+                    entry["usage"] = usage
+                choice = (event.get("choices") or [{}])[0]
+                delta = choice.get("delta") or {}
+                content = delta.get("content")
+                if content:
+                    text = str(content)
+                    chunks.append(text)
+                    yield text
+        except Exception as exc:
+            self._fail_call(entry, exc)
+            raise
+        else:
+            self._finish_call(entry, response_text="".join(chunks))
 
     def chat_json(
         self,

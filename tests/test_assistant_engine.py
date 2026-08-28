@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from paper_agent.core import assistant_engine as assistant_engine_module
 from paper_agent.core.assistant_engine import ResearchAssistantEngine, _search_source_summary, _source_query_plan
 from paper_agent.core.agent_runtime import IterativeAgentRuntime
 from paper_agent.core.intent import ActionIntent, IntentAnalyzer, RequestAnalysis, ResearchIntent
@@ -89,27 +90,48 @@ def test_source_query_plan_adds_openalex_facet_boolean_query_for_compound_topics
     assert "recommender" in combined or "recommendation" in combined
 
 
-def test_simple_greeting_uses_fast_chat_without_agent_or_kimi(tmp_path):
+def test_simple_greeting_uses_model_owned_free_chat_route(tmp_path):
     engine = ResearchAssistantEngine(store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs")
 
-    class FailingPlanner:
-        def decide(self, *args, **kwargs):
-            raise AssertionError("simple greeting should not call the Agent planner")
-
-    class FailingLlm:
+    class ChatLlm:
         available = True
+        model = "fake-kimi"
+
+        def chat_json(self, **kwargs):
+            return {
+                "category": "chat",
+                "subtask": "general_chat",
+                "deliverable": "none",
+                "evidence_scope": "none",
+                "tool_plan": ["free_chat"],
+                "needs_fresh_literature": False,
+                "reason": "普通自由交流。",
+                "confidence": 0.99,
+                "normalized_topic": "",
+                "cs_area": "Interdisciplinary CS",
+                "keywords": [],
+                "queries": [],
+                "source_queries": {},
+                "target_venues": [],
+                "target_venue_ranks": [],
+                "recent_years": None,
+                "from_year": None,
+                "to_year": None,
+            }
 
         def chat_text(self, **kwargs):
-            raise AssertionError("simple greeting should not call Kimi")
+            return "你好，我在。"
 
-    engine.agent_runtime.planner = FailingPlanner()
-    engine.llm = FailingLlm()
+    llm = ChatLlm()
+    engine.llm = llm
+    engine.intent_analyzer = IntentAnalyzer(llm=llm)
 
     events = list(engine.handle_stream("hello"))
 
-    assert next(event["content"] for event in events if event["type"] == "answer")
-    assert engine.state.last_tool_plan == ["fast_chat"]
-    assert engine.state.last_debug["kimi"]["called"] is False
+    assert next(event["content"] for event in events if event["type"] == "answer") == "你好，我在。"
+    assert engine.state.last_tool_plan == ["free_chat"]
+    action = next(event["action"] for event in events if event["type"] == "action")
+    assert action["source"] == "kimi"
 
 
 def test_search_results_are_checked_by_llm_for_topic_relevance(tmp_path):
@@ -551,6 +573,61 @@ def test_download_paper_pdf_failure_prompts_manual_upload(tmp_path):
     assert result["paper"]["fulltext_status"] == "none"
 
 
+def test_find_open_pdf_saves_explicit_scholar_resource(tmp_path):
+    engine = ResearchAssistantEngine(store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs")
+    paper = Paper(
+        title="Scholar Resource Lookup",
+        authors=["Ada Lovelace"],
+        year=2026,
+        source="dblp",
+        source_url="https://example.org/metadata",
+    )
+    engine.state.papers = [paper]
+    engine.store.save_papers([paper])
+
+    class ScholarWithPdf:
+        def lookup_by_title(self, title, *, year=None):
+            assert title == paper.title
+            assert year == paper.year
+            return Paper(
+                title=title,
+                authors=[],
+                source="google_scholar",
+                source_url="https://scholar.google.com/example",
+                pdf_url="https://repository.example.org/paper.pdf",
+            )
+
+    engine.search_service.google_scholar = ScholarWithPdf()
+    result = engine.find_open_pdf(paper.id)
+    restored = next(item for item in engine.store.load_papers() if item.id == paper.id)
+
+    assert result["ok"] is True
+    assert result["paper"]["pdf_url"] == "https://repository.example.org/paper.pdf"
+    assert restored.pdf_url == "https://repository.example.org/paper.pdf"
+
+
+def test_open_local_library_folder_uses_managed_pdf_directory(tmp_path, monkeypatch):
+    engine = ResearchAssistantEngine(store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs")
+    captured = {}
+
+    monkeypatch.setattr(assistant_engine_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        assistant_engine_module.subprocess,
+        "run",
+        lambda command, check, timeout: captured.update({"command": command, "check": check, "timeout": timeout}),
+    )
+
+    result = engine.open_local_library_folder()
+
+    assert result["ok"] is True
+    assert result["folder"] == str((tmp_path / "paper_files" / "pdf").resolve())
+    assert captured == {
+        "command": ["open", str((tmp_path / "paper_files" / "pdf").resolve())],
+        "check": True,
+        "timeout": 10,
+    }
+
+
 def test_upload_pdf_can_attach_fulltext_to_retrieved_paper(tmp_path):
     engine = ResearchAssistantEngine(store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs")
     paper = Paper(
@@ -576,6 +653,132 @@ def test_upload_pdf_can_attach_fulltext_to_retrieved_paper(tmp_path):
     assert restored.local_pdf_path
     assert restored.local_text_path
     assert "full method" in chunks[0].text
+
+
+def test_manual_pdf_upload_resolves_a_merged_paper_alias(tmp_path):
+    engine = ResearchAssistantEngine(store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs")
+    paper = Paper(
+        title="Alias-safe Manual PDF Attachment",
+        authors=["Ada Lovelace"],
+        year=2026,
+        source="openalex",
+        source_url="https://example.org/alias-safe",
+    )
+    engine.store.save_papers([paper])
+    with engine.store._connect() as conn:
+        conn.execute(
+            "INSERT INTO paper_id_aliases (alias_id, paper_id) VALUES (?, ?)",
+            ("legacy-paper-id", paper.id),
+        )
+
+    document = engine.upload_pdf(
+        _text_pdf_bytes("Manual binding must resolve the library record after a merge."),
+        filename="alias-safe.pdf",
+        paper_id="legacy-paper-id",
+    )
+
+    assert document["match"]["status"] == "manual"
+    assert document["linked_paper_id"] == paper.id
+    assert document["linked_paper"]["fulltext_status"] == "extracted"
+
+
+def test_upload_pdf_automatically_matches_a_known_paper_from_first_page(tmp_path):
+    engine = ResearchAssistantEngine(store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs")
+    paper = Paper(
+        title="Automatic Matching for Debiased Recommendation",
+        authors=["Ada Lovelace"],
+        year=2026,
+        source="openalex",
+        source_url="https://example.org/automatic-match",
+    )
+    engine.state.papers = [paper]
+    engine.store.save_papers([paper])
+
+    document = engine.upload_pdf(
+        _text_pdf_bytes("Automatic Matching for Debiased Recommendation This paper studies local full text matching."),
+        filename="downloaded-paper.pdf",
+    )
+
+    assert document["match"]["status"] == "matched"
+    assert document["match"]["confidence"] >= 0.82
+    assert document["linked_paper_id"] == paper.id
+    assert document["linked_paper"]["fulltext_status"] == "extracted"
+
+
+def test_upload_pdf_ignores_generic_section_heading_when_matching_title(tmp_path):
+    engine = ResearchAssistantEngine(store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs")
+    generic_heading = Paper(
+        title="Introduction",
+        authors=[],
+        year=2024,
+        source="google_scholar",
+        source_url="https://example.org/introduction",
+    )
+    target = Paper(
+        title="SPRec: Self-Play to Debias LLM-based Recommendation",
+        authors=["Chongming Gao"],
+        year=2025,
+        source="arxiv",
+        source_url="https://arxiv.org/abs/2412.09243",
+    )
+    engine.state.papers = [generic_heading, target]
+    engine.store.save_papers([generic_heading, target])
+
+    document = engine.upload_pdf(
+        _text_pdf_bytes(
+            "SPRec: Self-Play to Debias LLM-based Recommendation\n"
+            "Introduction\nThis paper introduces a self-play framework for debiased recommendation."
+        ),
+        filename="3696410.3714524.pdf",
+    )
+
+    assert document["match"]["status"] == "matched"
+    assert document["linked_paper_id"] == target.id
+
+
+def test_upload_pdf_leaves_low_confidence_document_unlinked(tmp_path):
+    engine = ResearchAssistantEngine(store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs")
+    paper = Paper(
+        title="Automatic Matching for Debiased Recommendation",
+        authors=["Ada Lovelace"],
+        year=2026,
+        source="openalex",
+        source_url="https://example.org/automatic-match",
+    )
+    engine.state.papers = [paper]
+    engine.store.save_papers([paper])
+
+    document = engine.upload_pdf(
+        _text_pdf_bytes("An unrelated vision benchmark with classification experiments."),
+        filename="vision-benchmark.pdf",
+    )
+
+    assert document["match"]["status"] == "unmatched"
+    assert "linked_paper_id" not in document
+
+
+def test_match_local_library_pdfs_binds_previously_unlinked_upload(tmp_path):
+    engine = ResearchAssistantEngine(store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs")
+    engine.upload_pdf(
+        _text_pdf_bytes("Library Reconciliation for Recommendation Papers This paper provides a local PDF matching test."),
+        filename="unknown-download.pdf",
+    )
+    paper = Paper(
+        title="Library Reconciliation for Recommendation Papers",
+        authors=["Ada Lovelace"],
+        year=2026,
+        source="openalex",
+        source_url="https://example.org/library-reconciliation",
+    )
+    engine.state.papers = [paper]
+    engine.store.save_papers([paper])
+
+    summary = engine.match_local_library_pdfs()
+    restored = next(item for item in engine.store.load_papers() if item.id == paper.id)
+
+    assert summary["scanned"] == 1
+    assert summary["matched"] == 1
+    assert restored.fulltext_status == "extracted"
 
 
 def test_writing_evidence_prefers_local_fulltext_chunks(tmp_path):
@@ -937,6 +1140,7 @@ def test_iterative_agent_searches_then_writes_from_the_observation(tmp_path):
         return [paper]
 
     engine._search_for_intent = search
+    engine._confirm_writing_request = lambda _request: {"should_write": True, "reason": "测试中的明确写作请求。"}
     engine._generate_document = lambda request: {
         "title": "Related Work",
         "query": "dynamic recommender systems",
@@ -957,6 +1161,38 @@ def test_iterative_agent_searches_then_writes_from_the_observation(tmp_path):
     assert "Dynamic Recommendation at Scale" in planner.requests[1]
 
 
+def test_agent_refuses_an_unrequested_document_after_a_plain_literature_search(tmp_path):
+    engine = ResearchAssistantEngine(store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs")
+    engine.agent_runtime = IterativeAgentRuntime(
+        FakeAgentPlanner(
+            [
+                {
+                    "kind": "tool",
+                    "tool": "paper_search",
+                    "arguments": {"normalized_topic": "object detection", "display_topic": "目标检测", "queries": ["object detection"], "recent_years": 3},
+                },
+                {
+                    "kind": "tool",
+                    "tool": "write_document",
+                    "arguments": {"deliverable": "outline"},
+                    "reason": "错误地把调研理解为大纲写作。",
+                },
+            ]
+        )
+    )
+    engine._search_for_intent = lambda _intent: [
+        Paper(title="A detector", authors=["Ada Lovelace"], abstract="Object detection research.", year=2025, source="dblp")
+    ]
+    engine._confirm_writing_request = lambda _request: {"should_write": False, "reason": "用户只要求调研进展。"}
+    engine._generate_document = lambda _request: (_ for _ in ()).throw(AssertionError("不应生成文稿"))
+
+    events = list(engine.handle_stream("调研一下近三年目标检测领域进展"))
+
+    assert any(event["type"] == "papers" for event in events)
+    assert not any(event["type"] == "document" for event in events)
+    assert "没有生成文稿" in next(event["content"] for event in events if event["type"] == "answer")
+
+
 def test_current_evidence_survey_writing_bypasses_agent_search(tmp_path):
     engine = ResearchAssistantEngine(
         store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs", upload_dir=tmp_path / "uploads"
@@ -968,13 +1204,14 @@ def test_current_evidence_survey_writing_bypasses_agent_search(tmp_path):
 
         def chat_json(self, **kwargs):
             return {
-                "category": "literature_search",
+                "category": "document_writing",
                 "subtask": "current_evidence_survey",
                 "deliverable": "survey",
+                "evidence_scope": "current_evidence",
+                "tool_plan": ["write_document"],
                 "action": "document",
                 "reason": "用户要基于已调研文献写综述章节。",
                 "confidence": 0.9,
-                "tools": ["paper_search", "write_document"],
                 "normalized_topic": "survey method introduction chapter",
                 "cs_area": "Interdisciplinary CS",
                 "keywords": ["survey", "method", "chapter"],
@@ -1056,7 +1293,7 @@ def test_agent_planner_failure_falls_back_to_legacy_search(tmp_path):
     assert engine.state.conversation_history.count({"role": "user", "content": "搜索近三年去偏动态推荐系统"}) == 1
 
 
-def test_agent_free_chat_for_search_request_falls_back_to_legacy_search(tmp_path):
+def test_agent_free_chat_decision_is_not_reclassified_by_keyword_rules(tmp_path):
     engine = ResearchAssistantEngine(store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs")
     engine.agent_runtime = IterativeAgentRuntime(
         FakeAgentPlanner(
@@ -1070,41 +1307,40 @@ def test_agent_free_chat_for_search_request_falls_back_to_legacy_search(tmp_path
             ]
         )
     )
-    intent = ResearchIntent(
-        original_request="搜索近三年去偏动态推荐系统",
-        normalized_topic="debiasing dynamic recommender systems",
-        cs_area="AI",
-        queries=["debiasing dynamic recommender systems"],
-        source_queries={
-            "dblp": ["debiasing dynamic recommender systems"],
-            "arxiv": ["debiasing dynamic recommender systems"],
-            "semantic_scholar": ["debiasing dynamic recommender systems"],
-            "google_scholar": ["debiasing dynamic recommender systems"],
-        },
-        recent_years=3,
-        source="test",
-    )
-    engine.intent_analyzer.analyze_request = lambda *args, **kwargs: RequestAnalysis(
-        action=ActionIntent("搜索近三年去偏动态推荐系统", "search", "fallback", 1.0, "test"),
-        research=intent,
-        tools=["paper_search"],
-    )
-    paper = Paper(
-        title="Debiasing Dynamic Recommendation",
-        authors=["Ada Lovelace"],
-        abstract="A paper about debiasing dynamic recommendation.",
-        year=2025,
-        source="dblp",
-        source_url="https://example.org/paper",
-    )
-    engine._search_for_intent = lambda research_intent: [paper]
-
     events = list(engine.handle_stream("搜索近三年去偏动态推荐系统"))
 
-    assert any(event["type"] == "papers" for event in events)
-    assert any("自由聊天切换到检索流程" in event.get("message", "") for event in events if event["type"] == "status")
-    assert engine.state.last_tool_plan == ["paper_search"]
-    assert engine.state.evidence_paper_ids == [paper.id]
+    assert not any(event["type"] == "papers" for event in events)
+    assert engine.state.last_tool_plan == ["free_chat"]
+    assert any(event["type"] == "answer" for event in events)
+
+
+def test_agent_free_chat_forwards_model_deltas_before_the_final_answer(tmp_path):
+    engine = ResearchAssistantEngine(store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs")
+
+    class StreamingChatLlm:
+        available = True
+        model = "fake-kimi"
+
+        def stream_text(self, **kwargs):
+            assert kwargs["label"] == "free_chat"
+            yield "## Hello\n\n"
+            yield "This reply arrives in pieces."
+
+    engine.llm = StreamingChatLlm()
+    engine.agent_runtime = IterativeAgentRuntime(
+        FakeAgentPlanner(
+            [{"kind": "tool", "tool": "free_chat", "arguments": {"message": "hello"}}]
+        )
+    )
+
+    events = list(engine.handle_stream("hello"))
+
+    assert [event["type"] for event in events].count("answer_start") == 1
+    assert [event["delta"] for event in events if event["type"] == "answer_delta"] == [
+        "## Hello\n\n",
+        "This reply arrives in pieces.",
+    ]
+    assert next(event["content"] for event in events if event["type"] == "answer") == "## Hello\n\nThis reply arrives in pieces."
 
 
 def test_iterative_agent_uses_current_evidence_for_followup_without_search(tmp_path):
@@ -1190,7 +1426,7 @@ def test_iterative_agent_pure_search_finishes_after_search_result(tmp_path):
                     "recent_years": 2,
                 },
             },
-            {"kind": "tool", "tool": "paper_search", "arguments": {"normalized_topic": "should not run"}},
+            {"kind": "final", "answer": "检索完成，已返回当前结果。"},
         ]
     )
     engine.agent_runtime = IterativeAgentRuntime(planner)
@@ -1207,10 +1443,9 @@ def test_iterative_agent_pure_search_finishes_after_search_result(tmp_path):
     events = list(engine.handle_stream("搜索近两年动态推荐系统论文"))
     answer = next(event["content"] for event in events if event["type"] == "answer")
 
-    assert len(planner.requests) == 1
+    assert len(planner.requests) == 2
     assert engine.state.last_tool_plan == ["paper_search"]
-    assert "已完成检索" in answer
-    assert "Dynamic Recommender Systems" in answer
+    assert answer == "检索完成，已返回当前结果。"
 
 
 def test_search_stops_repeating_source_after_rate_limit(tmp_path):
@@ -1249,6 +1484,30 @@ def test_search_stops_repeating_source_after_rate_limit(tmp_path):
 
     arxiv_calls = [call for call in engine.search_service.calls if call[0] == "arxiv"]
     assert len(arxiv_calls) == 1
+
+
+def test_discovery_profile_repairs_a_legacy_request_echo_topic(tmp_path):
+    engine = ResearchAssistantEngine(store_path=tmp_path / "papers.sqlite", output_dir=tmp_path / "outputs")
+    request = "调研一下最近三年去偏推荐系统工作进展"
+    engine.state.last_intent = ResearchIntent(
+        original_request=request,
+        normalized_topic=request,
+        cs_area="Interdisciplinary CS",
+    )
+    engine.state.research_topics = [request]
+    engine.intent_analyzer.repair_echoed_topic = lambda _request, _topic: {
+        "normalized_topic": "debiasing recommender systems",
+        "display_topic": "去偏推荐系统",
+        "keywords": ["debiasing", "recommendation"],
+        "queries": ["debiasing recommender systems"],
+        "cs_area": "AI",
+    }
+
+    profile = engine._discovery_profile(engine.state)
+
+    assert profile["primary_topic"] == "debiasing recommender systems"
+    assert profile["display_topic"] == "去偏推荐系统"
+    assert engine.state.research_topics == ["debiasing recommender systems"]
 
 
 def _text_pdf_bytes(text):

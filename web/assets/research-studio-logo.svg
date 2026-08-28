@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Research Studio">
+  <defs>
+    <linearGradient id="surface" x1="18" y1="14" x2="108" y2="116" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0F766E"/>
+      <stop offset="1" stop-color="#2456C6"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="42" y1="28" x2="84" y2="92" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#EAF4FF"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="5" stdDeviation="4" flood-color="#0C273B" flood-opacity=".24"/>
+    </filter>
+  </defs>
+  <rect x="10" y="10" width="108" height="108" rx="30" fill="url(#surface)"/>
+  <path d="M39 31c0-5.5 4.5-10 10-10h30l14 14v49c0 5.5-4.5 10-10 10H49c-5.5 0-10-4.5-10-10V31Z" fill="url(#paper)" filter="url(#shadow)"/>
+  <path d="M79 21v10c0 2.2 1.8 4 4 4h10" fill="none" stroke="#B7D8EF" stroke-linejoin="round" stroke-width="4"/>
+  <path d="M52 50h26M52 61h20M52 72h17" fill="none" stroke="#2456C6" stroke-linecap="round" stroke-width="4"/>
+  <path d="M75 73c5-1 9-4 12-8" fill="none" stroke="#0F766E" stroke-linecap="round" stroke-width="3.5"/>
+  <circle cx="73" cy="74" r="5" fill="#0F766E" stroke="#FFF" stroke-width="2"/>
+  <circle cx="89" cy="61" r="5" fill="#E3A342" stroke="#FFF" stroke-width="2"/>
+  <circle cx="96" cy="48" r="4" fill="#0F766E" stroke="#FFF" stroke-width="2"/>
+</svg>

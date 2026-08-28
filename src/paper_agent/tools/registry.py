@@ -50,11 +50,13 @@ class PaperToolRegistry:
                 "paper_search", "论文检索",
                 "检索本地缓存与 OpenAlex、DBLP、arXiv、Semantic Scholar、Google Scholar。",
                 {
-                    "normalized_topic": "English research topic",
+                    "normalized_topic": "required concise English research noun phrase; never the full user request",
+                    "display_topic": "required concise Chinese UI label for the same research topic",
                     "queries": "1-4 English query variants",
                     "source_queries": "optional source-specific query variants",
                     "target_venues": "explicit venue names only",
                     "target_venue_ranks": "CCF-A, CCF-B, SCI-Q1-Q3, arXiv",
+                    "cs_area": "NLP, AI, ML, CV, DB, SE, Security, Systems, Networks, HCI, Graphics, Theory, Robotics, or Interdisciplinary CS",
                     "recent_years": "integer or null",
                     "from_year": "integer or null",
                     "to_year": "integer or null",
@@ -78,8 +80,10 @@ class PaperToolRegistry:
                 lambda ctx, _plan: ctx.has_papers or ctx.has_documents,
             ),
             "write_document": PaperToolSpec(
-                "write_document", "学术写作", "生成章节、综述、Related Work、报告或 BibTeX。",
-                {"request": "writing request"}, "当前证据或同一计划中的论文检索", "正在基于当前证据生成写作草稿。", "academic-writing",
+                "write_document", "学术写作", "仅在用户明确要求写作交付物时生成章节、综述、Related Work、报告或 BibTeX；不能用于纯检索或调研请求。",
+                {
+                    "deliverable": "report, survey, related_work, introduction, method_section, experiment_section, summary, outline, bibliography, or general",
+                }, "当前证据或同一计划中的论文检索", "正在基于当前证据生成写作草稿。", "academic-writing",
                 lambda ctx, plan: ctx.has_papers or ctx.has_documents or "paper_search" in plan,
             ),
             "document_inspect": PaperToolSpec(

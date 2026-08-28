@@ -75,5 +75,9 @@ class PaperAgentOrchestrator:
                 has_generated_document=context.has_generated_document,
             ),
         )
-        skills = self.skill_catalog.for_plan(tools, category=analysis.category)
+        skills = self.skill_catalog.for_plan(
+            tools,
+            category=analysis.category,
+            deliverable=analysis.deliverable,
+        )
         return PreparedTask(analysis=analysis, tools=tools, skills=skills)

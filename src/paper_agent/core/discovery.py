@@ -41,6 +41,7 @@ class DiscoveryService:
 
     def discover_profile(self, profile: dict, *, recent_years: int = 1, limit: int = 24) -> dict:
         topic = normalize_text(str(profile.get("primary_topic") or "")) or "computer science"
+        display_topic = normalize_text(str(profile.get("display_topic") or "")) or topic
         topics = _clean_topics(profile.get("topics") or [topic])
         current_year = datetime.now(timezone.utc).year
         from_year = current_year - max(1, recent_years) + 1
@@ -71,9 +72,11 @@ class DiscoveryService:
         search_links = _platform_search_links(topic)
         return {
             "topic": topic,
+            "display_topic": display_topic,
             "topics": topics,
             "profile": {
                 "primary_topic": topic,
+                "display_topic": display_topic,
                 "topics": topics,
                 "seed_titles": list(profile.get("seed_titles") or [])[:8],
                 "paper_count": int(profile.get("paper_count") or 0),

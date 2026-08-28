@@ -14,6 +14,8 @@
 
 文献库正在按“长期科研资产”方向演进：数据库保存元数据、摘要、用户阅读状态、重要性、标签、排除原因和章节使用记录；PDF 原文与全文 chunk 保存在本地文件夹并由数据库记录路径。详细验收口径见 `docs/literature_library_evaluation.md`。
 
+产品目标、功能边界、Agent/Tool/Skill 设计、数据模型、接口、阶段优先级和发布验收标准见 [docs/product_requirements.md](docs/product_requirements.md)。
+
 ## 项目结构
 
 核心实现现在按职责拆分，避免把 Agent 编排、外部 API 和技能提示词堆在同一目录：
@@ -47,8 +49,25 @@ Web / CLI
 ```
 
 - Tool：`paper_search`、`pdf_read`、`paper_fulltext_read`、`evidence_answer`、`write_document`、`document_inspect`、`free_chat`。工具契约和可用条件统一定义在 `src/paper_agent/tools/registry.py`。
-- Skill：论文检索、证据问答、PDF 精读、学术写作、研究发现。每个 Skill 以独立 `SKILL.md` 保存工作流规则，位于 `src/paper_agent/skills/definitions/`。
+- Skill：论文检索、证据问答、PDF 精读、研究发现，以及按写作目标拆分的研究报告、综述、Related Work、引言、方法设计、实验设计、总结、大纲和 BibTeX 导出。每个 Skill 以独立 `SKILL.md` 保存工作流规则，位于 `src/paper_agent/skills/definitions/`。
 - Context：`data/sessions.json` 保存会话短期状态；SQLite 保存长期文献资产；PDF 正文保存在个人文献库文件夹。
+
+### 写作 Skill 与证据边界
+
+`write_document` 不再把所有请求套进 Related Work 模板。路由始终选择统一的 `academic-writing` Skill：先读取 `resources/writing-routing.md` 确认交付物，再加载对应 resource 和 `resources/markdown-contract.md`：
+
+```text
+研究报告       -> academic-writing/resources/report.md
+综述           -> academic-writing/resources/survey.md
+相关工作       -> academic-writing/resources/related-work.md
+引言           -> academic-writing/resources/introduction.md
+方法设计草案   -> academic-writing/resources/method.md
+实验设计       -> academic-writing/resources/experiment.md
+文献总结       -> academic-writing/resources/summary.md
+大纲 / BibTeX  -> academic-writing/resources/outline.md / bibliography.md
+```
+
+写作时优先使用本地 PDF 提取的相关片段；没有全文的论文只能用于高层定位。方法和实验 Skill 会明确保留待作者补充的信息，不能凭已有文献虚构“本文方法”或实验结果。模型草稿会检查标题结构、引用是否来自证据池、引用覆盖和重复段落；未通过时才使用同样按写作目标组织的离线草稿，并在质量报告中标记为兜底结果。
 
 未来若要接入 LangGraph、MCP 或其他模型，只需让新的运行时消费 `PaperToolRegistry` 和 `PaperSkillCatalog`，不需要重写检索、全文阅读或写作服务。
 
@@ -203,7 +222,9 @@ outputs/intent.json
 
 ## 使用 Kimi 作为 Agent LLM
 
-配置 API key 后，`investigate` 会优先用 Kimi 做研究意图识别和 Related Work 起草；没有 key 时会自动用规则和模板兜底。
+配置 API key 后，`investigate` 会使用 Kimi 做研究意图识别和 Related Work 起草。Web Agent 的意图路由完全由 Kimi 的结构化 JSON 决定；本地代码只校验工具是否可用，不会用关键词或正则表达式把模型的决定改写成另一种任务。
+
+如果 Kimi 未配置、超时或返回无效 JSON，系统会安全保留 `free_chat` 入口并提示路由不可用，**不会**猜测研究方向后自动检索。这避免了在模型不可用时把普通对话误判为论文调研。
 
 方式一：直接在代码里填写：
 
@@ -255,10 +276,16 @@ RSSHub 路由是否可用取决于你部署的实例和平台反爬状态，因�
 医学图像分割 -> medical image segmentation
 ```
 
-意图识别会输出结构化 JSON，核心字段包括：
+意图识别采用“类别 -> 子任务/交付物 -> 工具链”的两阶段系统提示词。模型先识别用户是在自由问答、检索、证据问答、PDF 阅读、写作、文件检查还是发现科研进展，再输出可执行工具链。核心 JSON 字段包括：
 
 ```json
 {
+  "category": "document_writing",
+  "subtask": "current_evidence_survey",
+  "deliverable": "survey",
+  "evidence_scope": "current_evidence",
+  "tool_plan": ["write_document"],
+  "needs_fresh_literature": false,
   "normalized_topic": "debiasing recommender systems",
   "cs_area": "AI",
   "keywords": ["debiasing", "recommender", "systems"],
@@ -279,7 +306,9 @@ RSSHub 路由是否可用取决于你部署的实例和平台反爬状态，因�
 }
 ```
 
-如果只想使用本地规则和模板：
+其中 `free_chat` 是永久保留的自由问答工具：例如 `hello`、研究思路讨论、非证据依赖的普通交流，模型会返回 `category: "chat"` 与 `tool_plan: ["free_chat"]`。当前已有论文或 PDF 不会自动把这类对话改成检索或证据问答。
+
+`--no-kimi` 可用于离线检索或在已有证据上生成确定性写作草稿，但不会启用自动意图识别和自动工具路由：
 
 ```bash
 python run.py investigate \

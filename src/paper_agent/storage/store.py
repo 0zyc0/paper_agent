@@ -278,12 +278,35 @@ class SQLitePaperStore:
                     ),
                 )
                 for duplicate_id in duplicate_ids:
+                    # Generated claim maps may keep the original paper ID.
+                    # Retain an alias before removing the duplicate so future
+                    # lookups can still resolve that provenance reference.
+                    conn.execute(
+                        """
+                        INSERT INTO paper_id_aliases (alias_id, paper_id)
+                        VALUES (?, ?)
+                        ON CONFLICT(alias_id) DO UPDATE SET paper_id = excluded.paper_id
+                        """,
+                        (duplicate_id, canonical.id),
+                    )
+                    conn.execute("UPDATE paper_id_aliases SET paper_id = ? WHERE paper_id = ?", (canonical.id, duplicate_id))
                     conn.execute("UPDATE paper_queries SET paper_id = ? WHERE paper_id = ?", (canonical.id, duplicate_id))
                     conn.execute("DELETE FROM papers WHERE id = ?", (duplicate_id,))
                 merged_count += len(duplicate_ids)
 
             after = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
         return {"before": before, "after": after, "merged": merged_count}
+
+    def resolve_paper_id(self, paper_id: str | None) -> str | None:
+        """Return the canonical ID for a current or previously merged paper."""
+        if not paper_id:
+            return None
+        with self._connect() as conn:
+            row = conn.execute("SELECT id FROM papers WHERE id = ?", (paper_id,)).fetchone()
+            if row:
+                return str(row["id"])
+            row = conn.execute("SELECT paper_id FROM paper_id_aliases WHERE alias_id = ?", (paper_id,)).fetchone()
+            return str(row["paper_id"]) if row else None
 
     def search_cached(
         self,
@@ -397,6 +420,16 @@ class SQLitePaperStore:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queries_topic ON paper_queries(topic)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queries_paper_id ON paper_queries(paper_id)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_id_aliases (
+                    alias_id TEXT PRIMARY KEY,
+                    paper_id TEXT NOT NULL,
+                    FOREIGN KEY(paper_id) REFERENCES papers(id)
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_aliases_canonical ON paper_id_aliases(paper_id)")
 
     def _ensure_paper_columns(self, conn: sqlite3.Connection) -> None:
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(papers)").fetchall()}

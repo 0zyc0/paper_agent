@@ -3,9 +3,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
+from difflib import SequenceMatcher
 import json
 from pathlib import Path
 import re
+import subprocess
+import sys
 from typing import Iterator
 from uuid import uuid4
 
@@ -20,7 +23,7 @@ from ..tools.http_client import HttpError
 from .models import Paper, normalize_text, utc_now_iso
 from .pdf_reader import PdfChunk, PdfExtractionError, extract_pdf_text, relevant_chunks
 from .rank import rank_papers
-from .related_work import RelatedWorkGenerator
+from .related_work import RelatedWorkGenerator, writing_plan_for
 from ..tools.search import PaperSearchService, dedupe_papers
 from ..tools.registry import PaperToolRegistry, ToolContext
 from ..storage.store import SQLitePaperStore
@@ -87,7 +90,11 @@ class ResearchAssistantEngine:
         self.search_service = PaperSearchService()
         self.discovery_service = DiscoveryService()
         self.fulltext_manager = PaperFullTextManager(Path(store_path).parent)
-        self.intent_analyzer = IntentAnalyzer()
+        # Agent planning and the legacy structured fallback must observe the
+        # same Kimi configuration.  Separate clients could otherwise make one
+        # route appear unavailable while the other can still call the model.
+        self.llm = KimiClient()
+        self.intent_analyzer = IntentAnalyzer(self.llm)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.upload_dir = Path(upload_dir) if upload_dir else self.fulltext_manager.pdf_dir
@@ -96,7 +103,6 @@ class ResearchAssistantEngine:
         self.session_store_path.parent.mkdir(parents=True, exist_ok=True)
         self.state = AssistantState()
         self.sessions: dict[str, AssistantState] = {"default": self.state}
-        self.llm = KimiClient()
         self.agent_runtime = IterativeAgentRuntime(self.llm)
         self.tool_registry = PaperToolRegistry()
         self.orchestrator = PaperAgentOrchestrator(tool_registry=self.tool_registry)
@@ -108,6 +114,8 @@ class ResearchAssistantEngine:
         self.state = state
         profile = self._discovery_profile(state, topic=topic)
         payload = self.discovery_service.discover_profile(profile, recent_years=1, limit=24)
+        # _discovery_profile may repair a legacy persisted request-as-topic.
+        self._persist_sessions()
         discovered_papers = [
             Paper(
                 title=item.get("title") or "",
@@ -143,9 +151,12 @@ class ResearchAssistantEngine:
         extraction = extract_pdf_text(data)
         document_id = uuid4().hex
         linked_paper = self._paper_by_id(paper_id or "") if paper_id else None
+        match = {"status": "manual" if paper_id else "unmatched", "confidence": 0.0, "reason": ""}
         attachment_summary = ""
         if paper_id and not linked_paper:
             raise PdfExtractionError("未找到要补全的论文，请刷新文献库后重试。")
+        if not linked_paper:
+            linked_paper, match = self._match_uploaded_pdf(extraction, filename)
         if linked_paper:
             result = self.fulltext_manager.attach_uploaded_pdf(linked_paper, data, extraction=extraction)
             self.store.save_papers([linked_paper])
@@ -167,12 +178,56 @@ class ResearchAssistantEngine:
         self.state.uploaded_documents.append(document)
         self._persist_sessions()
         payload = document.to_payload()
+        payload["match"] = match
         if linked_paper:
             payload["linked_paper_id"] = linked_paper.id
             payload["linked_paper_title"] = linked_paper.title
             payload["attachment_summary"] = attachment_summary
             payload["linked_paper"] = self._paper_payloads([linked_paper])[0]
         return payload
+
+    def match_local_library_pdfs(self, *, session_id: str = "default") -> dict:
+        """Attach already imported local PDFs to known papers when the match is clear.
+
+        This only scans the project's managed PDF directory. Ambiguous files are
+        deliberately left untouched so an unrelated paper is never bound by a
+        filename guess.
+        """
+        self.state = self._session_state(session_id)
+        managed_dir = self.fulltext_manager.pdf_dir
+        known_paths = {
+            str(Path(paper.local_pdf_path).resolve())
+            for paper in self.store.load_papers()
+            if paper.local_pdf_path and Path(paper.local_pdf_path).exists()
+        }
+        match_candidates = [*self.state.papers, *self.store.load_papers()]
+        summary = {"scanned": 0, "matched": 0, "unmatched": 0, "ambiguous": 0, "failed": 0, "papers": [], "details": []}
+        for path in sorted(managed_dir.glob("*.pdf")):
+            resolved = str(path.resolve())
+            if resolved in known_paths:
+                continue
+            summary["scanned"] += 1
+            try:
+                extraction = extract_pdf_text(path.read_bytes())
+            except Exception as exc:
+                summary["failed"] += 1
+                summary["details"].append({"name": path.name, "status": "failed", "reason": str(exc)[:160]})
+                continue
+            paper, match = self._match_uploaded_pdf(extraction, path.name, candidates=match_candidates)
+            status = str(match.get("status") or "unmatched")
+            if not paper:
+                summary[status if status in {"unmatched", "ambiguous"} else "unmatched"] += 1
+                summary["details"].append({"name": path.name, **match})
+                continue
+            result = self.fulltext_manager.attach_uploaded_pdf(paper, path.read_bytes(), extraction=extraction)
+            self.store.save_papers([paper])
+            self._upsert_session_paper(paper)
+            summary["matched"] += 1
+            summary["papers"].append(self._paper_payloads([paper])[0])
+            summary["details"].append({"name": path.name, "status": "matched", "paper_id": paper.id, "title": paper.title, "reason": result.summary, **match})
+        if summary["matched"]:
+            self._persist_sessions()
+        return summary
 
     def handle_stream(
         self,
@@ -182,26 +237,15 @@ class ResearchAssistantEngine:
         session_id: str = "default",
         evidence_paper_ids: list[str] | None = None,
     ) -> Iterator[dict]:
-        """Run one request through the compiled production route.
+        """Run one request through the model-owned intent route.
 
-        Custom, externally injected Agent runtimes remain supported for
-        integrations, while the built-in Kimi runtime uses IntentAnalyzer's
-        semantic classification plus deterministic plan compiler.
+        Python validates tool availability but never reclassifies the user's
+        wording after Kimi has produced the structured route.
         """
         try:
-            clean_message = message.strip()
-            if _is_simple_chat_message(clean_message):
-                yield from self._handle_fast_chat(clean_message, session_id=session_id)
-                return
-            # The production path uses the unified semantic router in IntentAnalyzer.
-            # A separately injected runtime is still supported for integrations/tests,
-            # but it cannot replace the deterministic route compiler in normal use.
-            use_custom_agent_runtime = (
-                type(self.intent_analyzer) is IntentAnalyzer
-                and self.agent_runtime.available
-                and getattr(self.agent_runtime, "llm", None) is not self.llm
-            )
-            if use_custom_agent_runtime:
+            # The standard path is the plan-act-observe Agent. The older
+            # structured router remains a safe fallback when Kimi is unavailable.
+            if self.agent_runtime.available:
                 yield from self._handle_agent_stream(
                     message,
                     mode=mode,
@@ -345,7 +389,7 @@ class ResearchAssistantEngine:
             yield {"type": "status", "message": "正在识别研究方向、年份范围和目标会议/期刊。"}
             intent = prefetched_intent or self.intent_analyzer.analyze(message)
             self.state.last_intent = intent
-            self._remember_research_topic(intent.normalized_topic)
+            self._remember_research_topic(intent.normalized_topic, intent.display_topic)
             yield {"type": "intent", "intent": self._intent_payload(intent)}
 
             yield {"type": "status", "message": "正在先查本地缓存，再检索 DBLP、arXiv、Semantic Scholar 和 Google Scholar。"}
@@ -415,19 +459,6 @@ class ResearchAssistantEngine:
             yield {"type": "error", "message": "请输入要调研或提问的内容。"}
             return
 
-        if _is_simple_chat_message(message):
-            yield from self._handle_fast_chat(message, session_id=session_id)
-            return
-        if _should_route_current_evidence_writing(message, has_evidence=bool(self._evidence_papers())):
-            yield {"type": "status", "message": "识别为基于当前证据池的写作请求，直接进入分层工具路由。"}
-            yield from self._handle_legacy_stream(
-                message,
-                mode=mode,
-                session_id=session_id,
-                evidence_paper_ids=evidence_paper_ids,
-            )
-            return
-
         self._remember_conversation("user", message)
         self.state.last_tool_plan = []
         observations: list[dict] = []
@@ -472,15 +503,6 @@ class ResearchAssistantEngine:
                 return
 
             if decision.kind == "final":
-                if not observations and _looks_like_literature_search_request(message):
-                    yield {"type": "status", "message": "检测到这是文献检索请求，正在切换到检索流程。"}
-                    yield from self._fallback_to_legacy_stream_after_agent_failure(
-                        message,
-                        mode=mode,
-                        session_id=session_id,
-                        evidence_paper_ids=evidence_paper_ids,
-                    )
-                    return
                 answer = decision.answer or (last_result.answer if last_result else "")
                 if not answer:
                     answer = "已完成当前请求，但没有得到可展示的文本结果。"
@@ -499,16 +521,6 @@ class ResearchAssistantEngine:
             if not tool:
                 observations.append({"tool": decision.tool, "ok": False, "summary": "未注册工具。", "answer": ""})
                 continue
-            if tool.name == "free_chat" and _looks_like_literature_search_request(message):
-                yield {"type": "status", "message": "检测到这是文献检索请求，已从自由聊天切换到检索流程。"}
-                yield from self._fallback_to_legacy_stream_after_agent_failure(
-                    message,
-                    mode=mode,
-                    session_id=session_id,
-                    evidence_paper_ids=evidence_paper_ids,
-                )
-                return
-
             signature = _tool_call_signature(tool.name, decision.arguments)
             if signature in seen_tool_calls:
                 yield {"type": "status", "message": f"检测到 Agent 重复调用 {tool.name}，已停止重复步骤并返回已有结果。"}
@@ -535,7 +547,26 @@ class ResearchAssistantEngine:
                 },
             }
             yield {"type": "status", "message": _agent_tool_status(tool.name)}
-            result = tool.execute(decision.arguments)
+            if tool.name == "free_chat":
+                chat_message = str(decision.arguments.get("message") or message).strip()
+                yield {"type": "answer_start"}
+                parts: list[str] = []
+                try:
+                    for delta in self._free_chat_stream(chat_message):
+                        if delta:
+                            text = str(delta)
+                            parts.append(text)
+                            yield {"type": "answer_delta", "delta": text}
+                except HttpError as exc:
+                    parts = [
+                        "Kimi 这次没有及时返回，可能是网络或模型响应较慢。\n\n"
+                        f"错误摘要：{exc}\n\n可以稍后重试，或缩短输入内容再试。"
+                    ]
+                    yield {"type": "answer_delta", "delta": parts[0]}
+                answer = "".join(parts).strip() or "我在。刚刚模型没有返回可展示内容，你可以继续问我检索、阅读或写作相关的问题。"
+                result = ToolResult("free_chat", "已完成自由聊天。", answer=answer, terminal=True)
+            else:
+                result = tool.execute(decision.arguments)
             last_result = result
             search_used = search_used or tool.name == "paper_search"
             observations.append(result.observation())
@@ -587,9 +618,18 @@ class ResearchAssistantEngine:
         """Expose existing engine capabilities as executable, validated Agent tools."""
 
         def paper_search(arguments: dict) -> ToolResult:
-            intent = self.intent_analyzer.research_from_plan(message, arguments, source="agent")
+            try:
+                intent = self.intent_analyzer.research_from_plan(message, arguments, source="agent")
+            except ValueError as exc:
+                return ToolResult(
+                    name="paper_search",
+                    ok=False,
+                    summary=str(exc),
+                    answer="请根据工具契约重新给出规范研究主题，而不是复制完整用户请求。",
+                    terminal=False,
+                )
             self.state.last_intent = intent
-            self._remember_research_topic(intent.normalized_topic)
+            self._remember_research_topic(intent.normalized_topic, intent.display_topic)
             papers = self._search_for_intent(intent)
             self.state.papers = papers
             self.state.evidence_paper_ids = [paper.id for paper in papers if paper.id]
@@ -621,7 +661,8 @@ class ResearchAssistantEngine:
                 summary=summary,
                 events=events,
                 answer=answer,
-                terminal=not _agent_search_should_continue_for_writing(message),
+                # The model decides whether to write after observing the search.
+                terminal=False,
             )
 
         def pdf_read(arguments: dict) -> ToolResult:
@@ -633,7 +674,8 @@ class ResearchAssistantEngine:
                 name="pdf_read",
                 summary="已从上传 PDF 提取并分析与请求相关的证据。",
                 answer=answer,
-                terminal=not _agent_pdf_read_should_continue(message),
+                # Keep the observation available for a model-planned writing step.
+                terminal=False,
             )
 
         def evidence_answer(arguments: dict) -> ToolResult:
@@ -665,11 +707,29 @@ class ResearchAssistantEngine:
             )
 
         def write_document(arguments: dict) -> ToolResult:
-            request = str(arguments.get("request") or message).strip()
+            # The Agent may select a writing *kind*, but it must not replace
+            # the user's actual request with a fabricated prompt such as
+            # "generate an outline".  The original message remains the sole
+            # source of the writing goal.
+            request = message
+            writing_kind = str(arguments.get("deliverable") or "").strip().lower()
+            admission = self._confirm_writing_request(request)
+            if not admission["should_write"]:
+                answer = self._search_only_completion_answer(admission["reason"])
+                return ToolResult(
+                    "write_document",
+                    "写作准入未通过：用户仅要求检索或调研，不应擅自生成文稿。",
+                    answer=answer,
+                    terminal=True,
+                )
             if self.state.uploaded_documents and not self._evidence_papers():
                 document = self._generate_pdf_document(request)
             elif self._evidence_papers():
-                document = self._generate_document(request)
+                document = (
+                    self._generate_document(request, writing_kind=writing_kind)
+                    if writing_kind
+                    else self._generate_document(request)
+                )
             else:
                 return ToolResult("write_document", "没有可用于写作的论文或 PDF 证据。", ok=False)
             answer = self._answer_about_generated_outputs("请展示生成内容预览")
@@ -736,7 +796,17 @@ class ResearchAssistantEngine:
             },
             "agent": {
                 "tools": self.tool_registry.payloads(),
-                "skills": [skill.payload() for skill in self.orchestrator.skill_catalog.for_plan(state.last_tool_plan)],
+                "skills": [
+                    skill.payload()
+                    for skill in self.orchestrator.skill_catalog.for_plan(
+                        state.last_tool_plan,
+                        category=getattr(state.last_intent, "category", ""),
+                        deliverable=(
+                            getattr(state.last_intent, "deliverable", "")
+                            or str((state.last_generated_document or {}).get("writing_kind") or "")
+                        ),
+                    )
+                ],
             },
         }
 
@@ -782,6 +852,62 @@ class ResearchAssistantEngine:
             "ok": ok,
             "message": message,
             "paper": self._paper_payloads([paper])[0],
+        }
+
+    def find_open_pdf(self, paper_id: str, *, session_id: str = "default") -> dict:
+        """Use Scholar's explicit PDF resource, if available, to enrich one library record."""
+        self.state = self._session_state(session_id)
+        paper = self._paper_by_id(paper_id)
+        if not paper:
+            return {"ok": False, "error": "未找到对应论文。"}
+        if paper.local_pdf_path and Path(paper.local_pdf_path).exists():
+            return {"ok": True, "message": "这篇论文已在个人文献库中。", "paper": self._paper_payloads([paper])[0]}
+        if paper.pdf_url:
+            return {"ok": True, "message": "该论文已经记录了开放 PDF 链接。", "paper": self._paper_payloads([paper])[0]}
+
+        try:
+            matched = self.search_service.google_scholar.lookup_by_title(paper.title, year=paper.year)
+        except Exception as exc:
+            return {"ok": False, "error": f"Google Scholar 查询失败：{exc}"}
+        if not matched or not matched.pdf_url:
+            return {
+                "ok": False,
+                "error": "Google Scholar 未返回可直接下载的公开 PDF 链接。可打开论文来源页确认，或手动上传你已获取的原文。",
+                "paper": self._paper_payloads([paper])[0],
+            }
+
+        paper.pdf_url = matched.pdf_url
+        self.store.save_papers([paper])
+        self._upsert_session_paper(paper)
+        self._persist_sessions()
+        return {
+            "ok": True,
+            "message": "已从 Google Scholar 的公开 PDF 资源中找到下载链接。",
+            "paper": self._paper_payloads([paper])[0],
+        }
+
+    def open_local_library_folder(self) -> dict:
+        """Open the managed personal-library PDF folder in the local file manager."""
+        folder = self.fulltext_manager.pdf_dir.resolve()
+        if sys.platform == "darwin":
+            command = ["open", str(folder)]
+        elif sys.platform.startswith("win"):
+            command = ["explorer", str(folder)]
+        else:
+            command = ["xdg-open", str(folder)]
+
+        try:
+            subprocess.run(command, check=True, timeout=10)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {
+                "ok": False,
+                "folder": str(folder),
+                "error": f"无法打开个人文献库文件夹：{exc}",
+            }
+        return {
+            "ok": True,
+            "folder": str(folder),
+            "message": "已打开个人文献库文件夹。",
         }
 
     def cached_paper_pdf_path(self, paper_id: str, *, session_id: str = "default") -> Path | None:
@@ -1473,12 +1599,7 @@ class ResearchAssistantEngine:
                 "你可以在 `src/paper_agent/local_config.py` 里填写 `KIMI_API_KEY`，"
                 "或者在启动服务前设置环境变量 `KIMI_API_KEY`。"
             )
-        history = self._conversation_history_text(limit=6, per_message_limit=360)
-        system = (
-            "You are a helpful, careful AI assistant embedded in a CS paper research tool. "
-            "You can freely chat with the user. If the user asks for paper search, remind them to switch to research mode or ask directly for a search."
-        )
-        user = f"历史对话：\n{history or '无'}\n\n用户新消息：\n{message}"
+        system, user = self._free_chat_prompt(message)
         try:
             answer = self.llm.chat_text(
                 system=system,
@@ -1486,6 +1607,7 @@ class ResearchAssistantEngine:
                 temperature=0.6,
                 max_tokens=700,
                 timeout=45,
+                stream=False,
                 label="free_chat",
             )
         except HttpError as exc:
@@ -1494,18 +1616,62 @@ class ResearchAssistantEngine:
                 f"错误摘要：{exc}\n\n"
                 "可以稍后重试，或缩短输入内容再试。"
             )
-        return normalize_text(answer) or "我在。刚刚模型没有返回可展示内容，你可以继续问我检索、阅读或写作相关的问题。"
+        # Preserve paragraphs, lists and headings so the browser Markdown
+        # renderer receives the document structure the model produced.
+        return answer.strip() or "我在。刚刚模型没有返回可展示内容，你可以继续问我检索、阅读或写作相关的问题。"
 
-    def _generate_document(self, request: str) -> dict:
+    def _free_chat_stream(self, message: str) -> Iterator[str]:
+        """Create the user-facing chat stream used by the Agent's free_chat tool."""
+        if not self.llm.available:
+            yield (
+                "当前没有配置 Kimi API key，所以不能自由聊天。\n\n"
+                "你可以在 `src/paper_agent/local_config.py` 里填写 `KIMI_API_KEY`，"
+                "或者在启动服务前设置环境变量 `KIMI_API_KEY`。"
+            )
+            return
+        system, user = self._free_chat_prompt(message)
+        stream_text = getattr(self.llm, "stream_text", None)
+        if callable(stream_text):
+            yield from stream_text(
+                system=system,
+                user=user,
+                temperature=0.6,
+                max_tokens=700,
+                timeout=90,
+                label="free_chat",
+            )
+            return
+        # Lightweight fakes and third-party-compatible clients used in tests
+        # may only implement chat_text. They still receive the same response
+        # contract, simply as one delta.
+        yield self._free_chat(message)
+
+    def _free_chat_prompt(self, message: str) -> tuple[str, str]:
+        history = self._conversation_history_text(limit=6, per_message_limit=360)
+        system = (
+            "You are a helpful, careful AI assistant embedded in a computer-science research workspace. "
+            "Answer the user directly and honestly. Tool routing is handled by the host Agent, so never ask the user "
+            "to switch modes and never claim a paper search ran unless the host supplied results. "
+            "Use clean Markdown: use headings only when useful, leave blank lines between paragraphs, use lists for "
+            "sequences, and do not put the whole answer on one line."
+        )
+        user = f"历史对话：\n{history or '无'}\n\n用户新消息：\n{message}"
+        return system, user
+
+    def _generate_document(self, request: str, *, writing_kind: str = "") -> dict:
         intent = self.state.last_intent
         evidence_papers = self._evidence_papers()
         topic = self._writing_topic(request, evidence_papers, intent)
         language = "zh" if _looks_chinese(request) else "en"
-        evidence_notes = self._prepare_writing_evidence(evidence_papers, request)
+        plan = writing_plan_for(request, writing_kind=writing_kind)
+        ranked_papers = rank_papers(evidence_papers, topic, limit=24) if topic else list(evidence_papers)
+        selected_papers = ranked_papers or list(evidence_papers)
+        evidence_query = f"{topic}\n{plan.title_for(language)}\n{request}"
+        evidence_notes = self._prepare_writing_evidence(selected_papers, evidence_query)
         evidence_report = _writing_evidence_report(evidence_notes)
         draft = RelatedWorkGenerator().generate(
             query=topic,
-            papers=evidence_papers,
+            papers=selected_papers,
             language=language,
             use_llm=KimiRelatedWorkWriter().available,
             writing_request=request,
@@ -1548,6 +1714,65 @@ class ResearchAssistantEngine:
         }
         self.state.last_generated_document = document
         return document
+
+    def _confirm_writing_request(self, request: str) -> dict[str, object]:
+        """Use a narrow model check before a planner can create a manuscript.
+
+        This is intentionally not a keyword or regular-expression gate.  It
+        asks Kimi one binary, evidence-free question: did the user explicitly
+        request a writing artefact, as opposed to only literature retrieval?
+        """
+        if not self.llm.available:
+            # The model-driven Agent is unavailable in this case, so preserve
+            # the existing offline writing behaviour for direct CLI callers.
+            return {"should_write": True, "reason": "Kimi 不可用，保留显式写作调用。"}
+        system = (
+            "You are a strict writing-admission checker for a research assistant. Return only valid JSON. "
+            "Decide whether the user explicitly requested a manuscript artefact to be written, generated, exported, "
+            "or revised. Do not infer a writing request from words such as research, investigate, survey as a verb, "
+            "study progress, literature retrieval, or latest developments. "
+            "A request to investigate recent progress is a search request, even if it could later support a report."
+        )
+        user = f"""
+Original user request:
+{request}
+
+Return exactly:
+{{"should_write": true or false, "reason": "short Chinese explanation"}}
+
+Examples:
+- “调研一下近三年目标检测领域进展” -> {{"should_write":false,"reason":"只要求检索和调研进展"}}
+- “查近三年目标检测论文，并写一份研究报告” -> {{"should_write":true,"reason":"明确要求研究报告"}}
+- “基于当前文献库写一篇综述” -> {{"should_write":true,"reason":"明确要求写综述"}}
+- “这些论文有什么进展” -> {{"should_write":false,"reason":"只是证据问答"}}
+"""
+        try:
+            data = self.llm.chat_json(
+                system=system,
+                user=user,
+                temperature=0.1,
+                max_tokens=220,
+                timeout=45,
+                stream=False,
+                label="writing_admission",
+            )
+        except Exception as exc:
+            return {"should_write": False, "reason": f"写作准入判断未完成：{type(exc).__name__}"}
+        return {
+            "should_write": bool(data.get("should_write") is True),
+            "reason": normalize_text(str(data.get("reason") or "未检测到明确写作交付物。")),
+        }
+
+    def _search_only_completion_answer(self, reason: object = "") -> str:
+        intent = self.state.last_intent
+        papers = self._evidence_papers()
+        topic = getattr(intent, "display_topic", "") or getattr(intent, "normalized_topic", "") or "当前主题"
+        extra = normalize_text(str(reason or ""))
+        lines = [f"已完成“{topic}”的文献调研，当前结果已进入文献库，共 {len(papers)} 篇候选论文。"]
+        if extra:
+            lines.append(f"本次没有生成文稿：{extra}")
+        lines.append("你可以继续要求筛选论文、比较研究路线，或明确提出要生成的章节/报告类型。")
+        return "\n\n".join(lines)
 
     def _writing_topic(self, request: str, papers: list[Paper], intent) -> str:
         """Do not reuse a previous full user request as a manuscript research topic."""
@@ -1693,7 +1918,7 @@ class ResearchAssistantEngine:
         self.state.conversation_history.append({"role": role, "content": text[:5000]})
         self.state.conversation_history = self.state.conversation_history[-28:]
 
-    def _remember_research_topic(self, topic: str) -> None:
+    def _remember_research_topic(self, topic: str, display_topic: str = "") -> None:
         topic = normalize_text(topic)
         if not topic:
             return
@@ -1701,6 +1926,7 @@ class ResearchAssistantEngine:
         self.state.research_topics = [topic, *existing][:12]
 
     def _discovery_profile(self, state: AssistantState, *, topic: str = "") -> dict:
+        self._repair_legacy_echoed_topic(state)
         topics: list[str] = []
         for candidate in [topic, *(state.research_topics or [])]:
             candidate = normalize_text(candidate)
@@ -1713,16 +1939,43 @@ class ResearchAssistantEngine:
         if not topics and state.papers:
             topics.append(_topic_from_papers(state.papers))
         primary_topic = topics[0] if topics else "computer science"
+        display_topic = normalize_text(getattr(state.last_intent, "display_topic", "")) if state.last_intent else ""
+        if not display_topic:
+            display_topic = primary_topic
         evidence = _state_evidence_papers(state)
         seed_titles = [paper.title for paper in evidence[:8] if paper.title]
         seed_abstracts = [paper.abstract for paper in evidence[:5] if paper.abstract]
         return {
             "primary_topic": primary_topic,
+            "display_topic": display_topic,
             "topics": topics[:5] or [primary_topic],
             "seed_titles": seed_titles,
             "seed_abstracts": seed_abstracts,
             "paper_count": len(state.papers),
         }
+
+    def _repair_legacy_echoed_topic(self, state: AssistantState) -> None:
+        """Repair persisted sessions produced before topic fields were strict."""
+        intent = state.last_intent
+        if not intent or not _is_request_echo_topic(intent.normalized_topic, intent.original_request):
+            return
+        repaired = self.intent_analyzer.repair_echoed_topic(intent.original_request, intent.normalized_topic)
+        normalized_topic = normalize_text(str(repaired.get("normalized_topic") or ""))
+        if not normalized_topic:
+            return
+        previous_topic = intent.normalized_topic
+        intent.normalized_topic = normalized_topic
+        intent.display_topic = normalize_text(str(repaired.get("display_topic") or ""))
+        if repaired.get("keywords"):
+            intent.keywords = [str(item) for item in repaired["keywords"]]
+        if repaired.get("queries"):
+            intent.queries = [str(item) for item in repaired["queries"]]
+        if repaired.get("cs_area"):
+            intent.cs_area = normalize_text(str(repaired["cs_area"]))
+        state.research_topics = [
+            normalized_topic,
+            *(item for item in state.research_topics if item.casefold() not in {previous_topic.casefold(), normalized_topic.casefold()}),
+        ][:12]
 
     def _conversation_history_text(self, *, limit: int, per_message_limit: int) -> str:
         rows = []
@@ -1825,15 +2078,54 @@ class ResearchAssistantEngine:
         evidence = [paper for paper in active_papers if paper.id in wanted]
         return evidence or active_papers
 
+    def _match_uploaded_pdf(
+        self,
+        extraction,
+        filename: str,
+        *,
+        candidates: list[Paper] | None = None,
+    ) -> tuple[Paper | None, dict]:
+        """Match a PDF to a library record without relying on an LLM or network call."""
+        context = _pdf_match_context(extraction, filename)
+        title_candidates: dict[str, Paper] = {}
+        candidate_records = candidates if candidates is not None else [*self.state.papers, *self.store.load_papers()]
+        for paper in candidate_records:
+            if paper.id and not paper.excluded:
+                # The same work can survive a migration under multiple IDs. Score
+                # one representative per normalized title so duplicate records do
+                # not turn an otherwise exact match into a false ambiguity.
+                title_key = _paper_title_key(paper.title)
+                if title_key:
+                    existing = title_candidates.get(title_key)
+                    if existing is None or _paper_match_record_score(paper) > _paper_match_record_score(existing):
+                        title_candidates[title_key] = paper
+        scored = sorted(
+            ((paper, _pdf_title_match_score(paper.title, context)) for paper in title_candidates.values()),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        if not scored or scored[0][1] < 0.82:
+            return None, {"status": "unmatched", "confidence": round(scored[0][1], 3) if scored else 0.0, "reason": "未从文件名或 PDF 首页识别出足够接近的论文标题。"}
+        best_paper, best_score = scored[0]
+        second_score = scored[1][1] if len(scored) > 1 else 0.0
+        if second_score >= 0.74 and best_score - second_score < 0.10:
+            return None, {"status": "ambiguous", "confidence": round(best_score, 3), "reason": "匹配到多个相近标题，未自动绑定以避免误关联。"}
+        return best_paper, {
+            "status": "matched",
+            "confidence": round(best_score, 3),
+            "reason": "已根据文件名和 PDF 首页文本自动匹配论文标题。",
+        }
+
     def _paper_by_id(self, paper_id: str) -> Paper | None:
         clean_id = normalize_text(paper_id)
         if not clean_id:
             return None
+        canonical_id = self.store.resolve_paper_id(clean_id) or clean_id
         for paper in self.state.papers:
-            if paper.id == clean_id:
+            if paper.id == canonical_id:
                 return paper
         for paper in self.store.load_papers():
-            if paper.id == clean_id:
+            if paper.id == canonical_id:
                 return paper
         return None
 
@@ -1896,69 +2188,74 @@ class ResearchAssistantEngine:
         self.state.last_debug = debug
         return debug
 
-    def _handle_fast_chat(self, message: str, *, session_id: str) -> Iterator[dict]:
-        """Answer tiny social turns locally so the Agent loop does not feel stuck."""
-        self.state = self._session_state(session_id)
-        kimi_log_start = KimiClient.log_size()
-        answer = _simple_chat_answer(message)
-        self.state.last_tool_plan = ["fast_chat"]
-        self.intent_analyzer.last_action_trace = {
-            "requested": "fast_chat",
-            "used": "local",
-            "fallback": False,
-            "error": "",
-        }
-        self._remember_conversation("user", message)
-        self.state.last_answer = answer
-        self._remember_conversation("assistant", answer)
-        yield {
-            "type": "action",
-            "action": {
-                "action": "chat",
-                "reason": "检测到普通寒暄，直接本地回复。",
-                "confidence": 1.0,
-                "source": "local",
-                "tools": ["fast_chat"],
-            },
-        }
-        yield {"type": "answer", "content": answer}
-        yield {"type": "debug", "debug": self._finalize_debug(action="chat", kimi_log_start=kimi_log_start, search_used=False)}
-
-
 def _looks_chinese(value: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", value))
-
-
-def _is_simple_chat_message(message: str) -> bool:
-    text = normalize_text(message).lower().strip("!！?？。.,， ")
-    if not text:
-        return False
-    greetings = {
-        "hi",
-        "hello",
-        "hey",
-        "你好",
-        "您好",
-        "嗨",
-        "哈喽",
-        "在吗",
-        "早上好",
-        "下午好",
-        "晚上好",
-    }
-    if text in greetings:
-        return True
-    return len(text) <= 12 and any(text.startswith(greeting) for greeting in greetings)
-
-
-def _simple_chat_answer(message: str) -> str:
-    return "你好，我在。你可以直接让我检索论文、解读 PDF、总结文献，或者基于当前证据写章节。"
 
 
 def _safe_pdf_filename(value: str) -> str:
     name = Path(value or "uploaded-paper.pdf").name
     name = re.sub(r"[^A-Za-z0-9._() -]+", "_", name).strip(" .")
     return name[:160] or "uploaded-paper.pdf"
+
+
+def _pdf_match_context(extraction, filename: str) -> str:
+    """Use only the first page and filename for a cheap, conservative match."""
+    first_page = "\n".join(
+        chunk.text for chunk in getattr(extraction, "chunks", [])
+        if getattr(chunk, "page", 0) == 1
+    )[:8_000]
+    filename_stem = Path(filename or "").stem.replace("_", " ").replace("-", " ")
+    return f"{filename_stem}\n{first_page}"
+
+
+_GENERIC_PDF_HEADING_TOKENS = {
+    "abstract", "acknowledgement", "acknowledgements", "acknowledgment", "acknowledgments",
+    "appendix", "background", "conclusion", "conclusions", "contents", "discussion",
+    "experiment", "experiments", "introduction", "keyword", "keywords", "method", "methods",
+    "overview", "preliminary", "references", "related", "result", "results", "survey", "work",
+}
+_TITLE_MATCH_STOP_TOKENS = {
+    "a", "an", "and", "based", "by", "for", "from", "in", "of", "on", "that", "the",
+    "this", "to", "toward", "towards", "using", "via", "with",
+}
+
+
+def _paper_title_key(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (title or "").lower())
+
+
+def _paper_match_record_score(paper: Paper) -> tuple[int, int, int, int, int]:
+    return (
+        int(bool(paper.doi or paper.arxiv_id)),
+        int(bool(paper.abstract)),
+        int(bool(paper.source_url)),
+        int(bool(paper.pdf_url)),
+        int(paper.year or 0),
+    )
+
+
+def _pdf_title_match_score(title: str, context: str) -> float:
+    title_key = _paper_title_key(title)
+    context_key = re.sub(r"[^a-z0-9]+", "", (context or "").lower())
+    if len(title_key) < 12 or not context_key:
+        return 0.0
+
+    title_tokens = {
+        token for token in re.findall(r"[a-z][a-z0-9]+", (title or "").lower())
+        if len(token) >= 3 and token not in _TITLE_MATCH_STOP_TOKENS and token not in _GENERIC_PDF_HEADING_TOKENS
+    }
+    # Headings such as "Introduction" and "Related Work" occur in nearly every
+    # PDF. They must never compete with a real paper title during auto-binding.
+    if len(title_tokens) < 2:
+        return 0.0
+    if title_key in context_key:
+        return 1.0
+
+    context_tokens = set(re.findall(r"[a-z][a-z0-9]+", (context or "").lower()))
+    coverage = len(title_tokens & context_tokens) / len(title_tokens) if title_tokens else 0.0
+    lines = [re.sub(r"[^a-z0-9]+", "", line.lower()) for line in (context or "").splitlines() if line.strip()]
+    sequence = max((SequenceMatcher(None, title_key, line).ratio() for line in lines if len(line) >= 12), default=0.0)
+    return 0.62 * coverage + 0.38 * sequence
 
 
 def _looks_like_pdf_question(question: str) -> bool:
@@ -2063,107 +2360,6 @@ def _tool_call_signature(tool_name: str, arguments: dict) -> str:
     return f"{tool_name}:{payload}"
 
 
-def _agent_pdf_read_should_continue(message: str) -> bool:
-    lowered = message.lower()
-    markers = (
-        "生成",
-        "写",
-        "撰写",
-        "导出",
-        "形成",
-        "保存",
-        "文件",
-        "章节",
-        "related work",
-        "文献综述",
-        "综述",
-        "bibtex",
-        ".bib",
-    )
-    return any(marker in lowered for marker in markers)
-
-
-def _agent_search_should_continue_for_writing(message: str) -> bool:
-    lowered = message.lower()
-    markers = (
-        "生成",
-        "写一",
-        "撰写",
-        "起草",
-        "导出",
-        "形成",
-        "保存为",
-        "文件",
-        "章节",
-        "related work",
-        "文献综述",
-        "综述草稿",
-        "bibtex",
-        ".bib",
-        "latex",
-        "markdown",
-    )
-    return any(marker in lowered for marker in markers)
-
-
-def _should_route_current_evidence_writing(message: str, *, has_evidence: bool) -> bool:
-    if not has_evidence:
-        return False
-    lowered = message.lower()
-    compact = re.sub(r"\s+", "", lowered)
-    current_markers = (
-        "按现在",
-        "已调研",
-        "已经调研",
-        "已有",
-        "已选",
-        "当前",
-        "当前证据池",
-        "当前文献池",
-        "当前论文池",
-        "这些论文",
-        "这些文献",
-        "基于这些",
-        "基于当前",
-        "根据这些",
-        "根据当前",
-        "current",
-        "existing",
-        "retrieved",
-    )
-    writing_markers = (
-        "写",
-        "撰写",
-        "生成",
-        "起草",
-        "形成",
-        "综述",
-        "survey",
-        "review",
-        "related work",
-        "章节",
-        "引言",
-        "摘要",
-        "方法",
-        "实验",
-        "讨论",
-        "结论",
-        "introduction",
-        "abstract",
-        "method",
-        "experiment",
-        "evaluation",
-        "discussion",
-        "conclusion",
-        "方法介绍",
-        "bibtex",
-        ".bib",
-    )
-    return any(marker in compact or marker in lowered for marker in current_markers) and any(
-        marker in compact or marker in lowered for marker in writing_markers
-    )
-
-
 def _is_source_rate_or_permission_error(value: str) -> bool:
     lowered = value.lower()
     return any(
@@ -2198,54 +2394,6 @@ def _search_answer_summary(intent: ResearchIntent, papers: list[Paper], source_s
     for index, paper in enumerate(papers[:6], start=1):
         lines.append(f"{index}. {paper.title}（{paper.year or 'n.d.'}，{paper.venue or paper.source}）")
     return "\n".join(lines)
-
-
-def _looks_like_literature_search_request(message: str) -> bool:
-    text = normalize_text(message).lower()
-    if not text:
-        return False
-    search_markers = (
-        "搜索",
-        "检索",
-        "查一下",
-        "查找",
-        "调研",
-        "文献",
-        "论文",
-        "最新",
-        "近两年",
-        "近三年",
-        "近五年",
-        "ccf",
-        "sci",
-        "arxiv",
-        "dblp",
-        "google scholar",
-        "semantic scholar",
-        "paper",
-        "papers",
-        "literature",
-        "survey",
-        "recent work",
-    )
-    venue_markers = (
-        "aaai",
-        "acl",
-        "cvpr",
-        "iccv",
-        "eccv",
-        "iclr",
-        "icml",
-        "ijcai",
-        "kdd",
-        "neurips",
-        "sigir",
-        "www",
-        "a会",
-        "b会",
-    )
-    year_pattern = re.search(r"(近\s*\d+\s*年|last\s+\d+\s+years?|past\s+\d+\s+years?)", text)
-    return any(marker in text for marker in search_markers) or any(marker in text for marker in venue_markers) or bool(year_pattern)
 
 
 def _search_source_summary(reports: dict) -> str:
@@ -2618,6 +2766,13 @@ def _topic_from_papers(papers: list[Paper]) -> str:
 def _looks_like_writing_request_echo(value: str) -> bool:
     compact = re.sub(r"\s+", "", value or "")
     return not compact or any(marker in compact for marker in ("调研", "工作进展", "最近", "近三年", "查一下", "我想", "文献库", "写一篇"))
+
+
+def _is_request_echo_topic(topic: str, request: str) -> bool:
+    """Only identify an exact stale request echo; never classify a topic locally."""
+    normalized_topic = normalize_text(topic).casefold()
+    normalized_request = normalize_text(request).casefold()
+    return bool(normalized_topic and normalized_request and normalized_topic == normalized_request)
 
 
 def _writing_evidence_report(notes: list[dict]) -> dict:

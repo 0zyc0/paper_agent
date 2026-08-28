@@ -7,6 +7,8 @@ const elements = {
   newSession: $("#newSessionBtn"),
   clear: $("#clearBtn"),
   upload: $("#uploadPdfBtn"),
+  openLibraryFolder: $("#openLibraryFolderBtn"),
+  matchLocalPdfs: $("#matchLocalPdfsBtn"),
   pdfInput: $("#pdfInput"),
   uploadInfo: $("#uploadInfo"),
   chatForm: $("#chatForm"),
@@ -147,6 +149,8 @@ function setBusy(isBusy, sessionId = state.activeSessionId) {
   elements.send.disabled = state.busy;
   elements.input.disabled = state.busy;
   elements.upload.disabled = state.busy;
+  elements.openLibraryFolder.disabled = state.busy;
+  elements.matchLocalPdfs.disabled = state.busy;
   elements.clear.disabled = state.busy;
   elements.newSession.disabled = false;
   elements.sessionSelect.disabled = false;
@@ -159,6 +163,8 @@ function syncActiveTaskUi() {
   elements.send.disabled = hasAnyTask;
   elements.input.disabled = hasAnyTask;
   elements.upload.disabled = hasAnyTask;
+  elements.openLibraryFolder.disabled = hasAnyTask;
+  elements.matchLocalPdfs.disabled = hasAnyTask;
   elements.clear.disabled = hasAnyTask;
   elements.newSession.disabled = false;
   elements.sessionSelect.disabled = false;
@@ -212,13 +218,13 @@ function renderSessionSelect() {
 }
 
 function renderWorkspaceMeta(session) {
-  const topic = session.intent?.normalized_topic || "未设置研究主题";
+  const topic = session.intent?.display_topic || session.intent?.normalized_topic || "未设置研究主题";
   elements.workspaceMeta.textContent = `${topic} · ${session.papers.length} 篇论文 · ${session.uploadedDocuments.length} 份 PDF`;
 }
 
 function renderProjectSignal(session) {
   const signals = [
-    ["研究主题", session.intent?.normalized_topic || "待识别"],
+    ["研究主题", session.intent?.display_topic || session.intent?.normalized_topic || "待识别"],
     ["证据论文", `${session.selectedPaperIds.length} / ${session.papers.length}`],
     ["上传文献", `${session.uploadedDocuments.length} 份`],
     ["写作草稿", `${session.files.length} 个文件`],
@@ -235,6 +241,7 @@ function renderMessages(session) {
     return;
   }
   session.messages.forEach((message) => renderMessage(message.role, message.content, false));
+  if (session.streamingAnswer?.content) renderMessage("assistant streaming", session.streamingAnswer.content, false);
   if (shouldShowProcess(session)) renderProcessMessage(session, false);
   elements.messages.scrollTop = elements.messages.scrollHeight;
 }
@@ -316,7 +323,7 @@ function renderIntent(intent) {
   }
   elements.intent.classList.remove("muted");
   const rows = [
-    ["方向", intent.normalized_topic || "-"],
+    ["方向", intent.display_topic || intent.normalized_topic || "-"],
     ["领域", intent.cs_area || "-"],
     ["范围", [(intent.target_venues || []).join(", "), (intent.target_venue_ranks || []).join(", ")].filter(Boolean).join(" · ") || "未限定"],
     ["年份", intent.recent_years ? `近 ${intent.recent_years} 年` : "未限定"],
@@ -396,6 +403,8 @@ function renderPaperFileAction(paper, evidence, session) {
     path = `<span class="local-path" title="${escapeAttr(localPath)}">${escapeHtml(localPath)}</span>`;
   } else if (canDownload) {
     actions = `<button class="tiny-button paper-download" type="button" data-paper-id="${escapeAttr(paper.id || "")}">下载 PDF</button>`;
+  } else if (paper.id) {
+    actions = `<button class="tiny-button paper-find-pdf" type="button" data-paper-id="${escapeAttr(paper.id)}">查找开放 PDF</button>`;
   }
   if (canUpload) {
     actions += `<button class="tiny-button paper-upload" type="button" data-paper-id="${escapeAttr(paper.id || "")}" title="把你本地的 PDF 绑定到这篇论文">上传原文</button>`;
@@ -438,7 +447,7 @@ function renderReader(session) {
 }
 
 function renderWriting(session) {
-  const topic = session.intent?.normalized_topic || "当前研究主题";
+  const topic = session.intent?.display_topic || session.intent?.normalized_topic || "当前研究主题";
   const draft = session.lastGeneratedDocument;
   const lines = [
     `${topic} 的研究背景、问题和范围`,
@@ -483,6 +492,11 @@ function renderDraftMeta(draft) {
   const evidence = draft.evidence_report || {};
   const labels = [];
   if (draft.writing_kind) labels.push(`<span class="draft-chip">${escapeHtml(writingKindLabel(draft.writing_kind))}</span>`);
+  if (quality.draft_source) {
+    const sourceLabel = quality.draft_source === "llm" ? "Kimi 写作" : "摘要兜底草稿";
+    const sourceClass = quality.draft_source === "llm" ? "verified" : "warning";
+    labels.push(`<span class="draft-chip ${sourceClass}">${sourceLabel}</span>`);
+  }
   if (quality.word_count) labels.push(`<span class="draft-chip">${Number(quality.word_count).toLocaleString()} 字</span>`);
   if (quality.citation_uses !== undefined) labels.push(`<span class="draft-chip">${Number(quality.citation_uses)} 处引用</span>`);
   const fulltext = quality.fulltext_paper_count ?? evidence.local_fulltext_count;
@@ -509,7 +523,7 @@ function writingKindLabel(kind) {
 }
 
 function renderDiscover(session) {
-  const topic = session.intent?.normalized_topic || "尚未设置主题";
+  const topic = session.intent?.display_topic || session.intent?.normalized_topic || "尚未设置主题";
   const discovery = session.discovery || null;
   if (elements.refreshDiscovery) elements.refreshDiscovery.disabled = session.discoveryLoading;
   const profile = discovery?.profile || {};
@@ -521,7 +535,7 @@ function renderDiscover(session) {
   elements.topicList.innerHTML = `
     <div class="discovery-profile">
       <span>${session.discoveryLoading ? "正在刷新" : "研究画像"}</span>
-      <strong>${escapeHtml(discovery?.topic || topic)}</strong>
+      <strong>${escapeHtml(discovery?.display_topic || discovery?.topic || topic)}</strong>
       <p>基于 ${Number(profile.paper_count || session.papers.length || 0)} 篇当前证据和 ${topics.length || 1} 个历史检索方向推荐。</p>
     </div>
     <div class="topic-chip-list">
@@ -642,7 +656,7 @@ async function sendMessage(message) {
       sessionId,
       evidencePaperIds: session.selectedPaperIds,
       onEvent: (event) => {
-        if (event.type === "answer" && String(event.content || "").trim()) receivedOutput = true;
+        if ((event.type === "answer" && String(event.content || "").trim()) || event.type === "answer_delta") receivedOutput = true;
         if (event.type === "document") receivedOutput = true;
         if (event.type === "papers" && Array.isArray(event.papers) && event.papers.length > 0) receivedOutput = true;
         if (event.type === "error") receivedError = true;
@@ -675,7 +689,9 @@ async function sendMessage(message) {
   }
 }
 
-async function uploadPdf(file, paperId = "") {
+async function uploadPdf(file, paperId = "", options = {}) {
+  const manageBusy = options.manageBusy !== false;
+  const announce = options.announce !== false;
   const sessionId = state.activeSessionId;
   const session = activeSession();
   const paper = paperId ? session.papers.find((item) => item.id === paperId) : null;
@@ -685,9 +701,11 @@ async function uploadPdf(file, paperId = "") {
   session.taskLog = [];
   session.processVisible = true;
   addTaskStep(session, "upload", "读取 PDF", session.taskState);
-  setBusy(true, sessionId);
-  setStatus(session.taskState);
-  renderMessages(session);
+  if (manageBusy) {
+    setBusy(true, sessionId);
+    setStatus(session.taskState);
+    renderMessages(session);
+  }
   try {
     const payload = await window.paperApi.documents.upload(file, sessionId, paperId);
     const target = sessionById(sessionId);
@@ -698,21 +716,111 @@ async function uploadPdf(file, paperId = "") {
     target.taskState = "";
     target.processVisible = false;
     const savedPath = payload.document.local_pdf_display_path || payload.document.local_pdf_path || "个人文献库";
-    addTaskStep(target, "done", "完成", `已读取 ${payload.document.name}，共 ${payload.document.page_count} 页。`);
+    const match = payload.match || {};
+    const matchLine = match.status === "matched"
+      ? `已自动匹配《${payload.document.linked_paper_title || "本地论文"}》。`
+      : match.status === "ambiguous"
+        ? "匹配到多个相近论文，未自动绑定。"
+        : "未匹配到已有论文，已作为独立本地文献保存。";
+    addTaskStep(target, "done", "完成", `已读取 ${payload.document.name}，共 ${payload.document.page_count} 页。${matchLine}`);
     const linkedTitle = payload.document.linked_paper_title;
     const attachLine = linkedTitle ? `\n\n已补全论文：**${linkedTitle}**。之后写作会优先使用这份本地全文。` : "";
-    appendMessage("assistant", `已读取 PDF：**${payload.document.name}**（${payload.document.page_count} 页，约 ${payload.document.char_count.toLocaleString()} 个字符）。${attachLine}\n\n保存位置：\`${savedPath}\``, sessionId);
+    if (announce) appendMessage("assistant", `已读取 PDF：**${payload.document.name}**（${payload.document.page_count} 页，约 ${payload.document.char_count.toLocaleString()} 个字符）。${matchLine}${attachLine}\n\n保存位置：\`${savedPath}\``, sessionId);
     if (sessionId === state.activeSessionId) setStatus("PDF 已就绪");
+    return payload;
   } catch (error) {
     const target = sessionById(sessionId);
     if (target) target.taskState = "PDF 上传失败";
     if (target) target.processVisible = false;
     if (target) addTaskStep(target, "error", "失败", error.message || String(error));
-    appendMessage("assistant error", `PDF 上传失败：${error.message || error}`, sessionId);
+    if (announce) appendMessage("assistant error", `PDF 上传失败：${error.message || error}`, sessionId);
     if (sessionId === state.activeSessionId) setStatus("PDF 上传失败");
+  } finally {
+    if (manageBusy) {
+      setBusy(false, sessionId);
+      if (sessionId === state.activeSessionId) render();
+    }
+  }
+}
+
+async function uploadPdfs(files, paperId = "") {
+  const validFiles = [...files].filter((file) => file.name.toLowerCase().endsWith(".pdf"));
+  if (!validFiles.length) {
+    appendMessage("assistant error", "请选择至少一份 PDF 文件。");
+    return;
+  }
+  if (paperId && validFiles.length > 1) {
+    appendMessage("assistant error", "给单篇论文补全文时一次只能选择一份 PDF；批量导入会自动匹配。" );
+    return;
+  }
+  const sessionId = state.activeSessionId;
+  const session = activeSession();
+  session.taskState = `正在导入 ${validFiles.length} 份 PDF 并自动匹配文献库...`;
+  session.taskLog = [];
+  session.processVisible = true;
+  addTaskStep(session, "upload", "导入", session.taskState);
+  setBusy(true, sessionId);
+  setStatus(session.taskState);
+  renderMessages(session);
+  let completed = 0;
+  let matched = 0;
+  try {
+    for (const file of validFiles) {
+      const before = session.uploadedDocuments.length;
+      const payload = await uploadPdf(file, paperId, { manageBusy: false, announce: false });
+      if (session.uploadedDocuments.length > before) {
+        completed += 1;
+        if (payload?.document?.linked_paper_id) matched += 1;
+      }
+    }
+    session.taskState = "";
+    session.processVisible = false;
+    addTaskStep(session, "done", "完成", `已导入 ${completed}/${validFiles.length} 份 PDF，自动匹配 ${matched} 篇。`);
+    appendMessage("assistant", `批量导入完成：已保存 ${completed}/${validFiles.length} 份 PDF，并自动绑定 ${matched} 篇文献库论文。未匹配的文件仍保存在个人文献库中，可继续阅读或手动绑定。`, sessionId);
   } finally {
     setBusy(false, sessionId);
     if (sessionId === state.activeSessionId) render();
+  }
+}
+
+async function matchLocalPdfs() {
+  const sessionId = state.activeSessionId;
+  const session = activeSession();
+  session.taskState = "正在扫描个人文献库中的未绑定 PDF...";
+  session.taskLog = [];
+  session.processVisible = true;
+  addTaskStep(session, "match", "匹配", session.taskState);
+  setBusy(true, sessionId);
+  setStatus(session.taskState);
+  renderMessages(session);
+  try {
+    const payload = await window.paperApi.library.matchLocalPdfs(sessionId);
+    (payload.papers || []).forEach((paper) => replaceSessionPaper(session, paper));
+    session.taskState = "";
+    session.processVisible = false;
+    addTaskStep(session, "done", "完成", `扫描 ${payload.scanned || 0} 份 PDF，自动绑定 ${payload.matched || 0} 篇。`);
+    appendMessage("assistant", `本地 PDF 整理完成：扫描 ${payload.scanned || 0} 份未绑定文件，自动匹配 ${payload.matched || 0} 篇；未匹配 ${payload.unmatched || 0} 篇，待确认 ${payload.ambiguous || 0} 篇。`, sessionId);
+  } catch (error) {
+    session.processVisible = false;
+    addTaskStep(session, "error", "失败", error.message || String(error));
+    appendMessage("assistant error", `匹配本地 PDF 失败：${error.message || error}`, sessionId);
+  } finally {
+    setBusy(false, sessionId);
+    if (sessionId === state.activeSessionId) render();
+  }
+}
+
+async function openLibraryFolder() {
+  const sessionId = state.activeSessionId;
+  try {
+    const payload = await window.paperApi.library.openFolder();
+    appendMessage(
+      "assistant",
+      `${payload.message || "已打开个人文献库文件夹。"}\n\n位置：\`${payload.folder || "data/paper_files/pdf/"}\``,
+      sessionId,
+    );
+  } catch (error) {
+    appendMessage("assistant error", `打开个人文献库失败：${error.message || error}`, sessionId);
   }
 }
 
@@ -759,6 +867,41 @@ async function downloadPaperPdf(paperId) {
   }
 }
 
+async function findOpenPdf(paperId) {
+  const sessionId = state.activeSessionId;
+  const session = activeSession();
+  if (!paperId || state.busy) return;
+  const paper = session.papers.find((item) => item.id === paperId);
+  session.taskState = `正在通过 Google Scholar 查找《${paper?.title || "论文"}》的公开 PDF...`;
+  addTaskStep(session, "find-pdf", "文献库", session.taskState);
+  setBusy(true, sessionId);
+  setStatus("正在查找开放 PDF");
+  render();
+  try {
+    const payload = await window.paperApi.library.findOpenPdf(sessionId, paperId);
+    const target = sessionById(sessionId);
+    if (!target) return;
+    if (payload.paper) replaceSessionPaper(target, payload.paper);
+    target.taskState = "";
+    target.processVisible = false;
+    addTaskStep(target, "done", "文献库", payload.message || "已更新开放 PDF 链接。");
+    appendMessage("assistant", `${payload.message || "已找到开放 PDF 链接。"}\n\n现在可在文献库中点击 **下载 PDF** 保存原文。`, sessionId);
+    if (sessionId === state.activeSessionId) setStatus("已找到开放 PDF");
+  } catch (error) {
+    const target = sessionById(sessionId);
+    if (target) {
+      target.taskState = "";
+      target.processVisible = false;
+      addTaskStep(target, "warning", "文献库", error.message || String(error));
+    }
+    appendMessage("assistant error", `未找到开放 PDF：${error.message || error}`, sessionId);
+    if (sessionId === state.activeSessionId) setStatus("未找到开放 PDF");
+  } finally {
+    setBusy(false, sessionId);
+    if (sessionId === state.activeSessionId) render();
+  }
+}
+
 function replaceSessionPaper(session, updatedPaper) {
   const index = session.papers.findIndex((paper) => paper.id === updatedPaper.id);
   if (index >= 0) session.papers.splice(index, 1, updatedPaper);
@@ -790,7 +933,7 @@ function handleEvent(event, sessionId) {
   }
   if (event.type === "intent") {
     session.intent = event.intent;
-    const topic = event.intent?.normalized_topic || "未识别主题";
+    const topic = event.intent?.display_topic || event.intent?.normalized_topic || "未识别主题";
     if (event.intent?.normalized_topic) {
       session.researchTopics = [
         event.intent.normalized_topic,
@@ -816,10 +959,22 @@ function handleEvent(event, sessionId) {
     session.files = [...(event.files || []), ...session.files];
     session.lastGeneratedDocument = event;
     addTaskStep(session, "document", "写作", `已生成 ${event.title || "写作草稿"} 和 ${event.files?.length || 0} 个文件。`);
+  } else if (event.type === "answer_start") {
+    session.streamingAnswer = { content: "" };
+  } else if (event.type === "answer_delta") {
+    if (!session.streamingAnswer) session.streamingAnswer = { content: "" };
+    session.streamingAnswer.content += String(event.delta || "");
   } else if (event.type === "answer") {
     session.processVisible = false;
     session.lastAnswer = event.content;
-    appendMessage("assistant", event.content, sessionId);
+    if (session.streamingAnswer) {
+      const streamed = session.streamingAnswer.content || "";
+      const content = String(event.content || "").trim() || streamed;
+      session.streamingAnswer = null;
+      appendMessage("assistant", content, sessionId);
+    } else {
+      appendMessage("assistant", event.content, sessionId);
+    }
   } else if (event.type === "debug") {
     session.debug = event.debug || null;
     const calls = event.debug?.kimi?.success_count || 0;
@@ -873,6 +1028,15 @@ async function fetchDiscovery(force = false) {
     payload.profile_key = topicKey;
     const target = sessionById(session.id);
     if (!target) return;
+    const repairedTopic = payload?.profile?.primary_topic || "";
+    const repairedLabel = payload?.profile?.display_topic || "";
+    if (repairedTopic) {
+      target.intent = { ...(target.intent || {}), normalized_topic: repairedTopic, display_topic: repairedLabel || target.intent?.display_topic || repairedTopic };
+      target.researchTopics = [
+        repairedTopic,
+        ...(target.researchTopics || []).filter((item) => item.toLowerCase() !== repairedTopic.toLowerCase()),
+      ].slice(0, 12);
+    }
     target.discovery = payload;
     target.discoveryLoading = false;
     target.updatedAt = Date.now();
@@ -1073,18 +1237,20 @@ elements.clear.addEventListener("click", async () => {
   setStatus("当前会话已清空");
 });
 elements.upload.addEventListener("click", () => elements.pdfInput.click());
+elements.openLibraryFolder.addEventListener("click", openLibraryFolder);
+elements.matchLocalPdfs.addEventListener("click", matchLocalPdfs);
 if (elements.refreshDiscovery) elements.refreshDiscovery.addEventListener("click", () => fetchDiscovery(true));
 elements.pdfInput.addEventListener("change", () => {
-  const [file] = elements.pdfInput.files || [];
+  const files = [...(elements.pdfInput.files || [])];
   elements.pdfInput.value = "";
-  if (!file) return;
-  if (!file.name.toLowerCase().endsWith(".pdf")) {
+  if (!files.length) return;
+  if (files.some((file) => !file.name.toLowerCase().endsWith(".pdf"))) {
     appendMessage("assistant error", "请选择 PDF 文件。");
     return;
   }
   const paperId = pendingPaperUploadId;
   pendingPaperUploadId = "";
-  uploadPdf(file, paperId);
+  uploadPdfs(files, paperId);
 });
 elements.chatForm.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -1114,6 +1280,11 @@ elements.libraryTableBody.addEventListener("click", (event) => {
   const downloadButton = event.target.closest(".paper-download");
   if (downloadButton) {
     downloadPaperPdf(downloadButton.dataset.paperId);
+    return;
+  }
+  const findPdfButton = event.target.closest(".paper-find-pdf");
+  if (findPdfButton) {
+    findOpenPdf(findPdfButton.dataset.paperId);
     return;
   }
   const uploadButton = event.target.closest(".paper-upload");

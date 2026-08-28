@@ -86,6 +86,21 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, paper_id: paperId }),
       }),
+      findOpenPdf: (sessionId, paperId) => request("/api/library/paper/find-open-pdf", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, paper_id: paperId }),
+      }),
+      matchLocalPdfs: (sessionId) => request("/api/library/match-local-pdfs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      }),
+      openFolder: () => request("/api/library/open-folder", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      }),
     },
     writing: {
       drafts: (projectId) => future(`/api/projects/${projectId}/drafts`),

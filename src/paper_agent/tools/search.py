@@ -471,6 +471,7 @@ class GoogleScholarClient:
                     venue=venue,
                     source="google_scholar",
                     source_url=normalize_text(item.get("link")) or None,
+                    pdf_url=_scholar_resource_pdf_url(item),
                     citation_count=_safe_int_from_text(
                         ((item.get("inline_links") or {}).get("cited_by") or {}).get("total")
                     ),
@@ -478,6 +479,22 @@ class GoogleScholarClient:
                 )
             )
         return papers
+
+    def lookup_by_title(self, title: str, *, year: int | None = None) -> Paper | None:
+        """Find a title-matched Scholar result and retain only its explicit PDF resource."""
+        clean_title = normalize_text(title)
+        if not clean_title or not self.available:
+            return None
+        candidates = self.search(
+            f'"{clean_title}"',
+            limit=6,
+            from_year=max(year - 2, 1900) if year else None,
+            to_year=year + 2 if year else None,
+        )
+        for candidate in candidates:
+            if candidate.pdf_url and _titles_match(clean_title, candidate.title):
+                return candidate
+        return None
 
 
 class PaperSearchService:
@@ -620,9 +637,17 @@ def dedupe_papers(papers: list[Paper]) -> list[Paper]:
 
 
 def merge_papers(left: Paper, right: Paper) -> Paper:
+    # Third-party aggregators often truncate authors and venue strings with an
+    # ellipsis. Prefer the richer record so degraded metadata does not replace
+    # a usable citation when the same work is later seen from another source.
+    if _metadata_text_score(right.title) > _metadata_text_score(left.title):
+        left.title = right.title
+    if _authors_score(right.authors) > _authors_score(left.authors):
+        left.authors = right.authors
     if right.abstract and (not left.abstract or len(right.abstract) > len(left.abstract)):
         left.abstract = right.abstract
-    left.venue = left.venue or right.venue
+    if _metadata_text_score(right.venue) > _metadata_text_score(left.venue):
+        left.venue = right.venue
     left.source_url = left.source_url or right.source_url
     left.pdf_url = left.pdf_url or right.pdf_url
     left.doi = left.doi or right.doi
@@ -650,6 +675,22 @@ def merge_papers(left: Paper, right: Paper) -> Paper:
     left.is_verified = bool(left.doi or left.arxiv_id or left.source_url)
     left.source = _merge_sources(left.source, right.source)
     return left
+
+
+def _metadata_text_score(value: str | None) -> float:
+    text = normalize_text(value)
+    if not text:
+        return 0.0
+    penalty = 10_000.0 if "…" in text or "..." in text else 0.0
+    return len(text) - penalty
+
+
+def _authors_score(authors: list[str]) -> float:
+    if not authors:
+        return 0.0
+    text = " ".join(authors)
+    penalty = 10_000.0 if "…" in text or "..." in text else 0.0
+    return len(authors) * 100 + len(text) - penalty
 
 
 def _merge_sources(*values: str | None) -> str:
@@ -786,6 +827,25 @@ def _parse_scholar_authors(summary: str) -> list[str]:
     first_part = summary.split(" - ")[0]
     authors = [normalize_text(author) for author in re.split(r",| and ", first_part)]
     return [author for author in authors if author and not re.search(r"\d{4}", author)][:8]
+
+
+def _scholar_resource_pdf_url(item: dict) -> str | None:
+    """Return only Scholar's explicit public PDF resource link, when present."""
+    resources = item.get("resources") or []
+    if isinstance(resources, dict):
+        resources = [resources]
+    for resource in resources:
+        if not isinstance(resource, dict):
+            continue
+        file_format = normalize_text(resource.get("file_format") or "").lower()
+        link = normalize_text(resource.get("link") or "")
+        if file_format == "pdf" and link.startswith(("https://", "http://")):
+            return link
+
+    primary_link = normalize_text(item.get("link") or "")
+    if primary_link.lower().split("?", 1)[0].endswith(".pdf") and primary_link.startswith(("https://", "http://")):
+        return primary_link
+    return None
 
 
 def _infer_scholar_venue(summary: str, target_venues: list[str] | None) -> str:

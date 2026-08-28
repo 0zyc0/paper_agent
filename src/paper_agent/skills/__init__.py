@@ -1,3 +1,1 @@
-"""Agent skill definitions used to build and validate tool plans."""
-
-from .planning import *
+"""Versioned paper-agent workflow instructions and their catalog."""

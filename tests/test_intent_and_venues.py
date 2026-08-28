@@ -1,34 +1,10 @@
 from paper_agent.core.intent import IntentAnalyzer
 from paper_agent.core.models import Paper
-from paper_agent.tools.search import DblpClient, OpenAlexClient, PaperSearchService, SemanticScholarClient
+from paper_agent.tools.search import DblpClient, GoogleScholarClient, OpenAlexClient, PaperSearchService, SemanticScholarClient
 from paper_agent.tools.venues import VenuePolicy
 
 
-def test_heuristic_intent_translates_chinese_cs_terms():
-    intent = IntentAnalyzer()._analyze_with_rules("我想调研大模型智能体在软件漏洞检测中的最新论文")
-
-    assert "large" in intent.normalized_topic
-    assert intent.cs_area in {"Security", "SE", "NLP", "Interdisciplinary CS"}
-    assert intent.queries
-
-
-def test_heuristic_intent_extracts_recent_years_and_venue():
-    intent = IntentAnalyzer()._analyze_with_rules("我想查近五年 ACL 上 RAG 相关论文")
-
-    assert intent.recent_years == 5
-    assert intent.target_venues == ["ACL"]
-
-
-def test_heuristic_intent_preserves_debiasing_recommender_qualifier():
-    intent = IntentAnalyzer()._analyze_with_rules("去偏推荐系统")
-
-    combined = " ".join([intent.normalized_topic, *intent.queries, *intent.source_queries["dblp"], *intent.source_queries["arxiv"]])
-    assert "debias" in combined or "fairness" in combined
-    assert "recommender" in combined or "recommendation" in combined
-    assert intent.source_queries["google_scholar"]
-
-
-def test_llm_intent_cannot_replace_explicit_debiasing_topic_or_time_range():
+def test_llm_intent_uses_structured_topic_and_time_range_without_rule_rewrite():
     class EchoingLlm:
         available = True
 
@@ -36,18 +12,20 @@ def test_llm_intent_cannot_replace_explicit_debiasing_topic_or_time_range():
             return {
                 "category": "literature_search",
                 "subtask": "paper_search",
-                "deliverable": "search_results",
+                "deliverable": "none",
+                "evidence_scope": "fresh_search",
+                "tool_plan": ["paper_search"],
                 "action": "search",
                 "reason": "检索论文。",
                 "confidence": 0.9,
-                "normalized_topic": "调研一下最近三年去偏推荐系统工作进展",
+                "normalized_topic": "debiasing recommender systems",
                 "cs_area": "Interdisciplinary CS",
-                "keywords": ["调研", "工作进展"],
-                "queries": ["调研一下最近三年去偏推荐系统工作进展"],
+                "keywords": ["debiasing", "recommender systems"],
+                "queries": ["debiasing recommender systems"],
                 "source_queries": {},
                 "target_venues": [],
                 "target_venue_ranks": [],
-                "recent_years": None,
+                "recent_years": 3,
                 "from_year": None,
                 "to_year": None,
             }
@@ -62,41 +40,22 @@ def test_llm_intent_cannot_replace_explicit_debiasing_topic_or_time_range():
     assert "debias" in " ".join(analysis.research.queries).lower()
 
 
-def test_heuristic_intent_preserves_dynamic_recommender_qualifier():
-    intent = IntentAnalyzer()._analyze_with_rules("动态推荐系统")
-
-    combined = " ".join([intent.normalized_topic, *intent.queries, *intent.source_queries["dblp"], *intent.source_queries["arxiv"]])
-    assert "dynamic" in combined or "time-aware" in combined
-    assert "recommender" in combined or "recommendation" in combined
-    assert intent.source_queries["semantic_scholar"]
-
-
-def test_heuristic_intent_builds_compound_openalex_query_for_debiasing_dynamic_recommender():
-    intent = IntentAnalyzer()._analyze_with_rules("去偏动态推荐系统")
-
-    combined = " ".join(intent.source_queries["openalex"]).lower()
-
-    assert "debias" in combined or "fairness" in combined or "unbiased" in combined
-    assert "dynamic" in combined or "temporal" in combined
-    assert "recommender" in combined or "recommendation" in combined
-
-
-def test_action_intent_detects_document_request():
+def test_action_intent_without_kimi_keeps_safe_free_chat_instead_of_keyword_routing():
     action = IntentAnalyzer().analyze_action("帮我基于这些论文生成 related work 和 bib 文件", has_papers=True)
 
-    assert action.action == "document"
+    assert action.action == "chat"
 
 
-def test_action_intent_detects_section_writing_request():
+def test_action_intent_without_kimi_does_not_classify_sections_with_rules():
     action = IntentAnalyzer().analyze_action("基于这些论文写一段引言", has_papers=True)
 
-    assert action.action == "document"
+    assert action.action == "chat"
 
 
-def test_action_intent_treats_short_generation_complaint_as_followup():
+def test_action_intent_without_kimi_does_not_classify_followups_with_rules():
     action = IntentAnalyzer().analyze_action("related work呢，怎么没有生成", has_papers=True)
 
-    assert action.action == "answer"
+    assert action.action == "chat"
 
 
 class FakeUnifiedIntentLlm:
@@ -108,6 +67,11 @@ class FakeUnifiedIntentLlm:
     def chat_json(self, **kwargs):
         self.calls.append(kwargs)
         return {
+            "category": "document_writing",
+            "subtask": "search_then_bibtex",
+            "deliverable": "bibtex",
+            "evidence_scope": "fresh_search",
+            "tool_plan": ["paper_search", "write_document"],
             "action": "document",
             "reason": "用户需要检索并生成引用文件。",
             "confidence": 0.96,
@@ -147,10 +111,14 @@ class FakeFollowUpPlannerLlm(FakeUnifiedIntentLlm):
     def chat_json(self, **kwargs):
         self.calls.append(kwargs)
         return {
+            "category": "evidence_qa",
+            "subtask": "current_evidence_question",
+            "deliverable": "answer",
+            "evidence_scope": "current_evidence",
+            "tool_plan": ["evidence_answer"],
             "action": "answer",
             "reason": "基于当前论文池回答追问。",
             "confidence": 0.95,
-            "tools": ["evidence_answer"],
             "normalized_topic": "",
             "cs_area": "AI",
             "keywords": [],
@@ -174,6 +142,27 @@ def test_contextual_question_uses_llm_routing_with_current_evidence():
     assert len(llm.calls) == 1
 
 
+def test_kimi_preserves_free_chat_even_when_a_paper_pool_exists():
+    class ChatRouteLlm:
+        available = True
+
+        def chat_json(self, **_kwargs):
+            return {
+                "category": "chat",
+                "subtask": "general_chat",
+                "deliverable": "none",
+                "evidence_scope": "none",
+                "tool_plan": ["free_chat"],
+                "reason": "普通自由交流。",
+            }
+
+    analysis = IntentAnalyzer(llm=ChatRouteLlm()).analyze_request("hello", has_papers=True)
+
+    assert analysis.category == "chat"
+    assert analysis.tools == ["free_chat"]
+    assert analysis.research is None
+
+
 class FakeSurveyWritingPlanLlm(FakeUnifiedIntentLlm):
     def chat_json(self, **kwargs):
         self.calls.append(kwargs)
@@ -184,7 +173,8 @@ class FakeSurveyWritingPlanLlm(FakeUnifiedIntentLlm):
             "action": "document",
             "reason": "用户要求基于已有文献写综述章节。",
             "confidence": 0.95,
-            "tools": ["paper_search", "write_document"],
+            "evidence_scope": "current_evidence",
+            "tool_plan": ["write_document"],
             "normalized_topic": "survey method introduction chapter",
             "cs_area": "Interdisciplinary CS",
             "keywords": ["survey", "method", "chapter"],
@@ -220,11 +210,19 @@ def test_current_evidence_survey_writing_does_not_trigger_search():
 class FakeWrongSurveyCategoryLlm(FakeSurveyWritingPlanLlm):
     def chat_json(self, **kwargs):
         data = super().chat_json(**kwargs)
-        data["category"] = "literature_search"
+        data["category"] = "document_writing"
         return data
 
 
-def test_current_evidence_writing_repairs_wrong_literature_category():
+class FakeIntroductionWritingLlm(FakeSurveyWritingPlanLlm):
+    def chat_json(self, **kwargs):
+        data = super().chat_json(**kwargs)
+        data["deliverable"] = "introduction"
+        data["subtask"] = "current_evidence_introduction"
+        return data
+
+
+def test_current_evidence_writing_uses_the_model_owned_route():
     llm = FakeWrongSurveyCategoryLlm()
     analysis = IntentAnalyzer(llm=llm).analyze_request(
         "按现在已调研的文献，写一篇survey综述方法介绍章节",
@@ -236,8 +234,8 @@ def test_current_evidence_writing_repairs_wrong_literature_category():
     assert analysis.research is None
 
 
-def test_current_evidence_introduction_never_triggers_external_search():
-    llm = FakeWrongSurveyCategoryLlm()
+def test_current_evidence_introduction_uses_explicit_model_scope():
+    llm = FakeIntroductionWritingLlm()
     analysis = IntentAnalyzer(llm=llm).analyze_request(
         "基于当前证据池生成 introduction",
         has_papers=True,
@@ -251,8 +249,8 @@ def test_current_evidence_introduction_never_triggers_external_search():
     assert analysis.research is None
 
 
-def test_current_retrieval_results_do_not_count_as_a_new_search():
-    analysis = IntentAnalyzer().analyze_request(
+def test_current_retrieval_results_follow_model_plan():
+    analysis = IntentAnalyzer(llm=FakeSurveyWritingPlanLlm()).analyze_request(
         "根据当前检索结果生成 introduction",
         has_papers=True,
     )
@@ -262,8 +260,8 @@ def test_current_retrieval_results_do_not_count_as_a_new_search():
     assert analysis.search_required is False
 
 
-def test_current_library_writing_treats_research_report_as_a_deliverable():
-    analysis = IntentAnalyzer().analyze_request(
+def test_current_library_writing_follows_model_plan_not_keywords():
+    analysis = IntentAnalyzer(llm=FakeSurveyWritingPlanLlm()).analyze_request(
         "我想基于目前文献库写一篇调研",
         has_papers=True,
     )
@@ -281,6 +279,8 @@ class FakeNewTopicWritingLlm(FakeUnifiedIntentLlm):
             "category": "document_writing",
             "subtask": "new_topic_survey",
             "deliverable": "survey",
+            "evidence_scope": "fresh_search",
+            "tool_plan": ["paper_search", "write_document"],
             "needs_fresh_literature": True,
             "topic_relation": "new_topic",
             "reason": "用户切换到目标检测这一新方向。",
@@ -303,7 +303,7 @@ def test_kimi_can_request_fresh_search_for_a_named_new_writing_topic():
     assert analysis.research.normalized_topic == "object detection"
 
 
-def test_research_topic_sanitizer_removes_survey_deliverable_terms():
+def test_research_topic_from_agent_plan_is_not_rewritten_by_regex_rules():
     intent = IntentAnalyzer().research_from_plan(
         "按现在已调研的文献，写一篇survey综述方法介绍章节",
         {
@@ -314,14 +314,43 @@ def test_research_topic_sanitizer_removes_survey_deliverable_terms():
     )
 
     combined = " ".join([intent.normalized_topic, *intent.queries, *intent.source_queries["dblp"]]).lower()
-    assert "survey" not in combined
-    assert "chapter" not in combined
+    assert "survey method introduction chapter" in combined
+
+
+def test_agent_request_echo_is_repaired_by_llm_before_becoming_a_research_topic():
+    class TopicRepairLlm:
+        available = True
+
+        def chat_json(self, **kwargs):
+            assert kwargs["label"] == "topic_repair"
+            return {
+                "normalized_topic": "debiasing recommender systems",
+                "display_topic": "去偏推荐系统",
+                "keywords": ["debiasing", "recommendation", "recommender systems"],
+                "queries": ["debiasing recommender systems", "debiasing recommendation"],
+                "cs_area": "AI",
+            }
+
+    request = "调研一下最近三年去偏推荐系统工作进展"
+    intent = IntentAnalyzer(llm=TopicRepairLlm()).research_from_plan(
+        request,
+        {"normalized_topic": request, "queries": [request]},
+    )
+
+    assert intent.normalized_topic == "debiasing recommender systems"
+    assert intent.display_topic == "去偏推荐系统"
+    assert intent.queries == ["debiasing recommender systems", "debiasing recommendation"]
 
 
 class FakePdfPlanLlm(FakeUnifiedIntentLlm):
     def chat_json(self, **kwargs):
         self.calls.append(kwargs)
         return {
+            "category": "document_writing",
+            "subtask": "uploaded_pdf_writing",
+            "deliverable": "related_work",
+            "evidence_scope": "uploaded_pdf",
+            "tool_plan": ["pdf_read", "write_document"],
             "action": "document",
             "reason": "先解读上传论文，再生成 related work。",
             "confidence": 0.98,
@@ -356,57 +385,14 @@ class FakeIncompletePdfPlanLlm(FakeUnifiedIntentLlm):
         return {"action": "answer", "reason": "解析上传论文", "confidence": "high"}
 
 
-def test_incomplete_kimi_pdf_plan_is_repaired_to_pdf_read_not_paper_search():
+def test_incomplete_kimi_pdf_plan_falls_back_to_safe_free_chat():
     llm = FakeIncompletePdfPlanLlm()
     analysis = IntentAnalyzer(llm=llm).analyze_request("解析一下这篇文章", has_documents=True)
 
-    assert analysis.action.action == "answer"
+    assert analysis.action.action == "chat"
     assert analysis.action.source == "kimi"
-    assert analysis.tools == ["pdf_read"]
+    assert analysis.tools == ["free_chat"]
     assert analysis.research is None
-
-
-def test_heuristic_intent_ignores_bib_output_format():
-    intent = IntentAnalyzer()._analyze_with_rules("查一下近两年ICLR上关于动态推荐系统的论文，形成一份.bib文件")
-
-    combined = " ".join([intent.normalized_topic, *intent.queries, *intent.source_queries["dblp"], *intent.source_queries["arxiv"]])
-    assert intent.recent_years == 2
-    assert intent.target_venues == ["ICLR"]
-    assert "dynamic" in combined
-    assert "bib" not in combined.lower()
-
-
-def test_dynamic_recommender_queries_include_short_rec_variants():
-    intent = IntentAnalyzer()._analyze_with_rules("查近三年AAAI上关于动态推荐系统的文章")
-
-    combined = " ".join([*intent.source_queries["dblp"], *intent.source_queries["semantic_scholar"]]).lower()
-    assert "dynamic rec" in combined
-    assert "dynamic recommendation" in combined
-
-
-def test_heuristic_intent_treats_a_b_conference_as_rank_filter():
-    intent = IntentAnalyzer()._analyze_with_rules("查近三年A会和B会的目标检测论文")
-
-    assert intent.target_venues == []
-    assert intent.target_venue_ranks == ["CCF-A", "CCF-B"]
-    assert intent.recent_years == 3
-    assert intent.normalized_topic == "object detection"
-
-
-def test_heuristic_intent_extracts_object_detection_domain():
-    intent = IntentAnalyzer()._analyze_with_rules("目标检测")
-
-    assert intent.normalized_topic == "object detection"
-    assert "object detection" in " ".join(intent.queries)
-    assert intent.cs_area == "CV"
-
-
-def test_heuristic_intent_preserves_open_vocabulary_modifier():
-    intent = IntentAnalyzer()._analyze_with_rules("开放词汇目标检测")
-
-    combined = " ".join([intent.normalized_topic, *intent.queries, *intent.source_queries["arxiv"]])
-    assert "open-vocabulary" in combined or "open vocabulary" in combined
-    assert "object detection" in combined
 
 
 def test_venue_policy_accepts_cs_arxiv_and_rejects_non_cs_arxiv():
@@ -618,6 +604,34 @@ def test_openalex_client_sends_api_key_and_mailto(monkeypatch):
     assert papers == []
     assert "api_key=openalex-test-key" in calls[0]["url"]
     assert "mailto=researcher%40example.com" in calls[0]["url"]
+
+
+def test_google_scholar_client_keeps_explicit_pdf_resource(monkeypatch):
+    from paper_agent.tools import search as search_module
+
+    monkeypatch.setenv("SERPAPI_API_KEY", "serpapi-test-key")
+    monkeypatch.setattr(
+        search_module,
+        "get_json",
+        lambda *args, **kwargs: {
+            "organic_results": [
+                {
+                    "title": "A Public Recommendation Paper",
+                    "link": "https://publisher.example.org/article",
+                    "publication_info": {"summary": "Ada Lovelace - SIGIR, 2025"},
+                    "resources": [
+                        {"title": "publisher.example.org", "file_format": "HTML", "link": "https://publisher.example.org/html"},
+                        {"title": "repository.example.org", "file_format": "PDF", "link": "https://repository.example.org/paper.pdf"},
+                    ],
+                }
+            ]
+        },
+    )
+
+    paper = GoogleScholarClient().search("public recommendation paper")[0]
+
+    assert paper.source_url == "https://publisher.example.org/article"
+    assert paper.pdf_url == "https://repository.example.org/paper.pdf"
 
 
 def test_semantic_scholar_retries_429_and_uses_local_config_key(monkeypatch):

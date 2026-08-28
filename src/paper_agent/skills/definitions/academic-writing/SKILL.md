@@ -1,5 +1,7 @@
-# 学术写作
+# 学术写作路由
 
-先确定写作类型、目标读者、语言与篇幅，再基于证据池组织论点。Related Work 必须按方法线或问题线综合比较，不能把参考文献条目直接拼成正文。Introduction、Method、Experiment 等章节使用对应学术结构。
+这是唯一的学术写作 Skill。它只服务于用户**明确要求生成、撰写、改写、导出或扩写文稿**的场景；“调研、检索、了解进展、找论文”不是写作请求，必须停在论文检索或证据问答。
 
-文中引用只能指向当前证据池真实论文；证据不足时说明空白或提出待补检索项。生成后提供 Markdown 预览、BibTeX 和证据映射，方便用户复核。
+运行时先读取 `resources/writing-routing.md` 确认唯一交付物，再注入对应资源：`report.md`、`survey.md`、`related-work.md`、`introduction.md`、`method.md`、`experiment.md`、`summary.md`、`outline.md` 或 `bibliography.md`。不能因为已有论文就猜测用户需要大纲、Related Work 或报告。
+
+所有分支共同遵守 `resources/markdown-contract.md`。先以用户原始请求确定写作目标，再使用当前证据写出完整正文；引用只能来自当前证据池。优先使用本地全文片段，题名或摘要只能用于高层定位。生成后提供 Markdown、BibTeX 和证据映射供用户核对。

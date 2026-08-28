@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>科研写作助手</title>
+    <link rel="icon" type="image/svg+xml" href="/assets/research-studio-logo.svg" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -11,7 +12,7 @@
       <aside class="sidebar" aria-label="主导航">
         <header class="brand-block">
           <div class="brand-row">
-            <div class="brand-mark" aria-hidden="true">R</div>
+            <div class="brand-mark" aria-hidden="true"><img src="/assets/research-studio-logo.svg" alt="" /></div>
             <div>
               <p class="brand-kicker">RESEARCH STUDIO</p>
               <h1>科研写作助手</h1>
@@ -57,8 +58,10 @@
             <figure class="workspace-visual" aria-hidden="true">
               <img src="/assets/research-desk.png" alt="" loading="lazy" />
             </figure>
-            <button id="uploadPdfBtn" class="secondary-button" type="button">上传 PDF</button>
-            <input id="pdfInput" type="file" accept="application/pdf,.pdf" hidden />
+            <button id="openLibraryFolderBtn" class="secondary-button" type="button">打开文献库</button>
+            <button id="matchLocalPdfsBtn" class="secondary-button" type="button">匹配本地 PDF</button>
+            <button id="uploadPdfBtn" class="secondary-button" type="button">批量导入 PDF</button>
+            <input id="pdfInput" type="file" accept="application/pdf,.pdf" multiple hidden />
           </div>
         </header>
 

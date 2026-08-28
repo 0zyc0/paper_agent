@@ -12,6 +12,67 @@ from pathlib import Path
 
 
 SKILL_ROOT = Path(__file__).with_name("definitions")
+ACADEMIC_WRITING_ROOT = SKILL_ROOT / "academic-writing"
+
+
+@dataclass(frozen=True)
+class WritingSkillRoute:
+    """Resolved resource bundle for the one academic-writing skill."""
+
+    deliverable: str
+    resource: str
+    instruction: str
+    routing: str
+    markdown_contract: str
+
+    def payload(self) -> dict:
+        return {
+            "skill": "academic-writing",
+            "deliverable": self.deliverable,
+            "resource": f"resources/{self.resource}.md",
+        }
+
+
+class AcademicWritingSkillRouter:
+    """Navigate one Skill.md to its resource-level writing instruction.
+
+    Mirrors Mydex's structured-response pattern: a routing resource defines the
+    stable branches, while the runtime injects only the selected branch plus the
+    shared Markdown contract into the writer prompt.
+    """
+
+    _RESOURCE_BY_DELIVERABLE = {
+        "report": "report",
+        "survey": "survey",
+        "related_work": "related-work",
+        "introduction": "introduction",
+        "method_section": "method",
+        "experiment_section": "experiment",
+        "summary": "summary",
+        "outline": "outline",
+        "bibliography": "bibliography",
+        "bibtex": "bibliography",
+    }
+
+    def __init__(self, root: Path = ACADEMIC_WRITING_ROOT) -> None:
+        self.root = root
+        self.resources = root / "resources"
+
+    def route(self, deliverable: str) -> WritingSkillRoute:
+        resource = self._RESOURCE_BY_DELIVERABLE.get(deliverable, "general")
+        return WritingSkillRoute(
+            deliverable=deliverable or "general",
+            resource=resource,
+            instruction=self._read(f"{resource}.md"),
+            routing=self._read("writing-routing.md"),
+            markdown_contract=self._read("markdown-contract.md"),
+        )
+
+    def _read(self, name: str) -> str:
+        try:
+            return (self.resources / name).read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
 
 
 @dataclass(frozen=True)
@@ -21,12 +82,26 @@ class PaperSkill:
     description: str
     tools: tuple[str, ...]
     path: Path
+    variant: str = ""
 
     def prompt(self) -> str:
         try:
-            return self.path.read_text(encoding="utf-8").strip()
+            router_prompt = self.path.read_text(encoding="utf-8").strip()
         except OSError:
-            return self.description
+            router_prompt = self.description
+        if not self.variant:
+            return router_prompt
+        try:
+            variant_prompt = (self.path.parent / "resources" / f"{self.variant}.md").read_text(encoding="utf-8").strip()
+            routing_prompt = (self.path.parent / "resources" / "writing-routing.md").read_text(encoding="utf-8").strip()
+            contract_prompt = (self.path.parent / "resources" / "markdown-contract.md").read_text(encoding="utf-8").strip()
+        except OSError:
+            return router_prompt
+        return (
+            f"{router_prompt}\n\n## 写作路由\n\n{routing_prompt}"
+            f"\n\n## 当前写作分支：{self.variant}\n\n{variant_prompt}"
+            f"\n\n## 共同 Markdown 契约\n\n{contract_prompt}"
+        ).strip()
 
     def payload(self) -> dict:
         return {
@@ -34,6 +109,8 @@ class PaperSkill:
             "title": self.title,
             "description": self.description,
             "tools": list(self.tools),
+            "variant": self.variant or None,
+            "instruction_file": f"academic-writing/resources/{self.variant}.md" if self.variant else "academic-writing/SKILL.md",
         }
 
 
@@ -42,6 +119,7 @@ class PaperSkillCatalog:
 
     def __init__(self, root: Path = SKILL_ROOT) -> None:
         self.root = root
+        self.writing_router = AcademicWritingSkillRouter(root / "academic-writing")
         self._skills = {
             "literature-research": PaperSkill(
                 "literature-research",
@@ -79,8 +157,7 @@ class PaperSkillCatalog:
                 root / "research-discovery" / "SKILL.md",
             ),
         }
-
-    def for_plan(self, tools: list[str], *, category: str = "") -> list[PaperSkill]:
+    def for_plan(self, tools: list[str], *, category: str = "", deliverable: str = "") -> list[PaperSkill]:
         wanted: list[str] = []
         if "paper_search" in tools:
             wanted.append("literature-research")
@@ -88,11 +165,30 @@ class PaperSkillCatalog:
             wanted.append("pdf-reading")
         if "evidence_answer" in tools:
             wanted.append("evidence-grounding")
+        selected: list[PaperSkill] = []
+        for name in wanted:
+            skill = self._skills.get(name)
+            if skill:
+                selected.append(skill)
         if "write_document" in tools or "document_inspect" in tools:
-            wanted.append("academic-writing")
+            selected.append(self._academic_writing_skill(deliverable))
         if category == "discovery":
-            wanted.append("research-discovery")
-        return [self._skills[name] for name in wanted if name in self._skills]
+            skill = self._skills.get("research-discovery")
+            if skill:
+                selected.append(skill)
+        return selected
+
+    def _academic_writing_skill(self, deliverable: str) -> PaperSkill:
+        base = self._skills["academic-writing"]
+        variant = self.writing_router.route(deliverable).resource
+        return PaperSkill(
+            name=base.name,
+            title=base.title,
+            description=base.description,
+            tools=base.tools,
+            path=base.path,
+            variant=variant,
+        )
 
     def get(self, name: str) -> PaperSkill | None:
         return self._skills.get(name)

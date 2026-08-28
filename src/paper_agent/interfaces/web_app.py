@@ -89,6 +89,15 @@ class ResearchAssistantHandler(BaseHTTPRequestHandler):
         if path == "/api/library/paper/download":
             self._handle_paper_download()
             return
+        if path == "/api/library/paper/find-open-pdf":
+            self._handle_find_open_pdf()
+            return
+        if path == "/api/library/match-local-pdfs":
+            self._handle_match_local_pdfs()
+            return
+        if path == "/api/library/open-folder":
+            self._handle_open_library_folder()
+            return
         if path not in {"/api/chat/stream", "/api/session/clear"}:
             self.send_error(404, "Not found")
             return
@@ -113,6 +122,7 @@ class ResearchAssistantHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
         self.send_header("Connection", "close")
         self.end_headers()
         try:
@@ -161,6 +171,44 @@ class ResearchAssistantHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": f"下载论文 PDF 失败：{exc}"}, status=400)
             return
         self._send_json(result)
+
+    def _handle_find_open_pdf(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            session_id = str(payload.get("session_id") or "default")
+            paper_id = str(payload.get("paper_id") or "").strip()
+            if not paper_id:
+                raise ValueError("paper_id 不能为空。")
+            with self.engine_lock:
+                result = self.engine.find_open_pdf(paper_id, session_id=session_id)
+        except Exception as exc:
+            self._send_json({"ok": False, "error": f"查找开放 PDF 失败：{exc}"}, status=400)
+            return
+        self._send_json(result, status=200 if result.get("ok") else 404)
+
+    def _handle_match_local_pdfs(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            session_id = str(payload.get("session_id") or "default")
+            with self.engine_lock:
+                result = self.engine.match_local_library_pdfs(session_id=session_id)
+        except Exception as exc:
+            traceback.print_exc()
+            self._send_json({"ok": False, "error": f"匹配本地 PDF 失败：{exc}"}, status=500)
+            return
+        self._send_json({"ok": True, **result})
+
+    def _handle_open_library_folder(self) -> None:
+        try:
+            with self.engine_lock:
+                result = self.engine.open_local_library_folder()
+        except Exception as exc:
+            traceback.print_exc()
+            self._send_json({"ok": False, "error": f"打开个人文献库失败：{exc}"}, status=500)
+            return
+        self._send_json(result, status=200 if result.get("ok") else 500)
 
     def log_message(self, format: str, *args) -> None:
         sys.stderr.write("[web] " + format % args + "\n")
